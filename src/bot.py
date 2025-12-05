@@ -37,11 +37,10 @@ def start_bot():
     """
     print("🔌 Loading configuration...")
     config = load()
-    token = config.telegram.token
 
     print("🚀 Building Application...")
     # ApplicationBuilder is the modern, async way to build bots in PTB v20+
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(config.telegram.token).build()
 
     # 1. Register Core Handlers (Upstream stuff)
     application.add_handler(CommandHandler("start", start))
