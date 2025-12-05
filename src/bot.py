@@ -12,12 +12,10 @@ def build(conversation: Conversation) -> Lingo:
     chatbot = Lingo(
         name="Bot",
         description="a friendly chatbot",
-        llm = LLM(**config.llm.model_dump()),
-
+        llm=LLM(**config.llm.model_dump()),
         # You can also modify the system prompt
         # to completely replace the chatbot personality.
         system_prompt=config.prompts.system,
-
         # We pass the conversation wrapper here
         conversation=conversation,
     )
@@ -30,7 +28,12 @@ def build(conversation: Conversation) -> Lingo:
     @chatbot.skill
     async def chat(ctx: Context, engine: Engine):
         """Basic chat skill, just replies normally."""
-        await engine.reply(ctx)
+
+        # Compute reply directly from LLM
+        msg = await engine.reply(ctx)
+
+        # Add it to the context (otherwise the bot won't remember its response)
+        ctx.append(msg)
 
     # ... Add your extra skills and tools here
     # ...
