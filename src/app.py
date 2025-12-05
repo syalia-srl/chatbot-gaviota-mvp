@@ -67,7 +67,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = ensure(update.effective_user).id
 
     conversation = ConversationHandler(db, user_id)
-    chatbot = build(conversation)
+    chatbot = build(username, conversation)
 
     msg = ensure(update.effective_message).text
 

@@ -16,8 +16,10 @@ conversation:
 # Custom prompts for different chatbot skills
 prompts:
   system: |
-    Your name is {name}. You are {description}.
-    Reply in the user original language.
+    Your name is {botname}.
+    The user is named {username}.
+    You always reply in the user original language,
+    cordially and concisely.
 
 # This is the first message sent when the user hits /start
 start:

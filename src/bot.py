@@ -3,19 +3,18 @@ from lingo.core import Conversation
 from config import load
 
 
-def build(conversation: Conversation) -> Lingo:
+def build(username: str, conversation: Conversation) -> Lingo:
     config = load()
 
-    # Change name and description as desired to
-    # fit in the system prompt
+    # Instantiate our chatbot
 
     chatbot = Lingo(
-        name="Bot",
-        description="a friendly chatbot",
+        # Change name and description as desired to
+        # fit in the system prompt
         llm=LLM(**config.llm.model_dump()),
         # You can also modify the system prompt
         # to completely replace the chatbot personality.
-        system_prompt=config.prompts.system,
+        system_prompt=config.prompts.system.format(username=username, botname="Bot"),
         # We pass the conversation wrapper here
         conversation=conversation,
     )
@@ -32,7 +31,7 @@ def build(conversation: Conversation) -> Lingo:
         # Compute reply directly from LLM
         msg = await engine.reply(ctx)
 
-        # Add it to the context (otherwise the bot won't remember its response)
+        # Add it to the context (otherwise the bot won't remember its own response)
         ctx.append(msg)
 
     # ... Add your extra skills and tools here
