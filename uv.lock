@@ -220,15 +220,15 @@ wheels = [
 
 [[package]]
 name = "lingo-ai"
-version = "0.3.1"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "openai" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/89/e3/258e4c5d8c9c1bc2b59c9b6f1cf6d4a246071bc3f51a5e9b0c030e2e0e0c/lingo_ai-0.3.1.tar.gz", hash = "sha256:5dee322c010a29098348c8370d0adf75b09e8d9e61e6f1f965ad1c713ca95344", size = 51221 }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/55/de959d3ba1ba245530dadd7c676dad87ca4438c618e23eb72f7231b70fd4/lingo_ai-0.4.0.tar.gz", hash = "sha256:0477b37dfba0adf8903d9e4b9d8590da86ee6c5ff26585a8559c4c3a7d9763d6", size = 51320 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/63/483b6ce776f11c12d3106de91fab5e5eadcaa7a6ef6b1f604f9ca4033b70/lingo_ai-0.3.1-py3-none-any.whl", hash = "sha256:932a2f3725d51157c00702a09839c38d9359ea4511a633878117c3e5694d1688", size = 18160 },
+    { url = "https://files.pythonhosted.org/packages/2a/67/2d7ef90a13932c4e09e8ddfc5f1fffc8eee696238678bea448c78bba5228/lingo_ai-0.4.0-py3-none-any.whl", hash = "sha256:7ccde3288cc533bc2f288137e33026d19b75b7e370493df28361628061b5963e", size = 18252 },
 ]
 
 [[package]]
