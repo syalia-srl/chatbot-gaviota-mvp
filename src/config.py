@@ -13,8 +13,12 @@ class TelegramConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     model: str
-    token: str
-    url: str
+    api_key: str
+    base_url: str
+
+
+class PromptsConfig(BaseModel):
+    system: str
 
 
 class ConversationConfig(BaseModel):
@@ -25,8 +29,9 @@ class Config(BaseModel):
     telegram: TelegramConfig
     llm: LLMConfig
     conversation: ConversationConfig
+    prompts: PromptsConfig
     db: str = "bot.db"
-
+    start: str
 
 def patch(data: dict):
     for k,v in data.items():

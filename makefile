@@ -1,3 +1,3 @@
 .PHONY: run
 run:
-	uv run src/bot.py
+	uv run src/app.py
