@@ -75,18 +75,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Standard welcome message.
     """
-    username = ensure(update.effective_user).first_name
-
-    await ensure(update.message).reply_text(config.start.format(username=username))
-
-
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Standard welcome message.
-    """
     user_id = ensure(update.effective_user).id
     conversation = ConversationHandler(db, user_id)
     conversation.clear()
+
+    username = ensure(update.effective_user).first_name
+
+    await ensure(update.message).reply_text(config.start.format(username=username))
 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,7 +112,6 @@ def start_bot():
     application = ApplicationBuilder().token(config.telegram.token).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear", clear))
     application.add_handler(MessageHandler(filters.TEXT, chat))
 
     print("✅ Bot is running! Press Ctrl+C to stop.")
