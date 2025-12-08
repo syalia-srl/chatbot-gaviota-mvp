@@ -208,3 +208,5 @@ __marimo__/
 
 config.yaml
 *.db*
+data/*
+!data/.gitkeep
