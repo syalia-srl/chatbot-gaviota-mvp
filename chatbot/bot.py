@@ -23,46 +23,26 @@ def build(username: str, conversation: Conversation) -> Lingo:
         # We pass the conversation wrapper here
         conversation=conversation,
     )
-
-    # Add skills for the chatbot here
-    # Check out Lingo's documentation
-    # to learn how to write custom skills:
-    # <https://github.com/gia-uh/lingo>
-
-    # @chatbot.skill
-    # async def chat(ctx: Context, engine: Engine):
-    #     """Basic chat skill, just replies normally."""
-
-    #     # Compute reply directly from LLM
-    #     msg = await engine.reply(ctx)
-
-    #     # Add it to the context (otherwise the bot won't remember its own response)
-    #     ctx.append(msg)
-
-    #     print(ctx.messages)
     
     class SearchLimit(BaseModel):
         """Structure to extract the exact quantity of results requested."""
         quantity: int
 
-    # @chatbot.skill
-    # async def city_explorer(ctx: Context, engine: Engine):
-    #     """Architect of Urban Experiences and Trip Planning.
+    @chatbot.skill
+    async def city_explorer(ctx: Context, engine: Engine):
+        """Architect of Urban Experiences and Trip Planning.
 
-    #     This skill is responsible for the logistics of discovery and the organization 
-    #     of time and space. It uses the administrative hierarchy (Location, Municipality, 
-    #     Province) to structure plans and find nearby options.
+        This skill is responsible for the logistics of discovery and the organization 
+        of time and space. It uses the administrative hierarchy (Location, Municipality, 
+        Province) to structure plans and find nearby options.
 
-    #     RESPONSIBILITY:
-    #     - Planning: Crafting itineraries and logical sequences of activities.
-    #     - Spatial Discovery: Navigating the territory to connect the user with places 
-    #     based on their relative position and regional context.
-    #     """
-        
-    #     msg = await engine.reply(ctx, Message.system("Inform also you wor using ROUTING TEST: Routed to 'CityExplorerSkill'"))
-    #     ctx.append(msg)
-        
-    #     print(ctx.messages + ['CityExplorerSkill'])
+        RESPONSIBILITY:
+        - Planning: Crafting itineraries and logical sequences of activities.
+        - Spatial Discovery: Navigating the territory to connect the user with places 
+        based on their relative position and regional context.
+        """
+
+        print('Skill: CityExplorerSkill')
 
 
     @chatbot.skill
@@ -148,41 +128,36 @@ def build(username: str, conversation: Conversation) -> Lingo:
             
             
 
-    # @chatbot.skill
-    # async def gastro_guide(ctx: Context, engine: Engine):
-    #     """Expert on Gastronomy, Culinary Identity, and Food Establishments.
+    @chatbot.skill
+    async def gastro_guide(ctx: Context, engine: Engine):
+        """Expert on Gastronomy, Culinary Identity, and Food Establishments.
 
-    #     This skill is the authority on the culinary scene. Use it for queries where 
-    #     the central subject is food, drink, or the specialized knowledge of or about 
-    #     restaurants, bars, and paladares, regardless of their physical placement.
+        This skill is the authority on the culinary scene. Use it for queries where 
+        the central subject is food, drink, or the specialized knowledge of or about 
+        restaurants, bars, and paladares, regardless of their physical placement.
 
-    #     RESPONSIBILITY: 
-    #     - Expert on 'What to eat' and the 'Nature of dining venues'.
-    #     - Handles descriptions, menus, and culinary vibes.
-    #     """
+        RESPONSIBILITY: 
+        - Expert on 'What to eat' and the 'Nature of dining venues'.
+        - Handles descriptions, menus, and culinary vibes.
+        """
         
-    #     msg = await engine.reply(ctx, Message.system("Inform also you wor using ROUTING TEST: Routed to 'GastroGuideSkill'"))
-    #     ctx.append(msg)
+        print('Skill: GastroGuideSkill')
         
-    #     print(ctx.messages + ['GastroGuideSkill'])
 
 
 
-    # @chatbot.skill
-    # async def location_manager(ctx: Context, engine: Engine):
-    #     """Manager of User's Current Geographical Presence.
+    @chatbot.skill
+    async def location_manager(ctx: Context, engine: Engine):
+        """Manager of User's Current Geographical Presence.
 
-    #     This skill is strictly responsible for maintaining and updating the user's 
-    #     active origin point within the administrative system (Location, Municipality, Province).
+        This skill is strictly responsible for maintaining and updating the user's 
+        active origin point within the administrative system (Location, Municipality, Province).
 
-    #     RESPONSIBILITY:
-    #     - Origin State: Calibrating the 'start point' for all spatial reasoning.
-    #     """
+        RESPONSIBILITY:
+        - Origin State: Calibrating the 'start point' for all spatial reasoning.
+        """
         
-    #     msg = await engine.reply(ctx, Message.system("Inform also you wor using ROUTING TEST: Routed to 'LocationManagerSkill'"))
-    #     ctx.append(msg)
-        
-    #     print(ctx.messages + ['LocationManagerSkill'])
+        print('Skill: LocationManagerSkill')
         
 
 
