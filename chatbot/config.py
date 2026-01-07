@@ -36,6 +36,7 @@ class Config(BaseModel):
     conversation: ConversationConfig
     prompts: PromptsConfig
     db: str = "bot.db"
+    index_files_folder: str = "data/jsons"
     start: str
 
 
