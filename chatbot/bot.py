@@ -86,16 +86,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
     @chatbot.skill
     async def concierge(ctx: Context, engine: Engine):
         """
-        Specialist in ACCOMMODATION LOGISTICS and HOSPITALITY ASSETS.
-
-        DOMAIN AUTHORITY:
-        - **Lodging**: Sole responsibility for any query related to sleeping, staying, or booking rooms (Hotels, Resorts, Hostels, Campismos).
-        - **Establishment Features**: Handles queries about amenities (Pools, Spas, Wifi) within a lodging context.
-        - **Commercial Entities**: Identifies and processes specific hospitality brands or chains mentioned by the user.
-
-        TRIGGERS:
-        - User wants to FIND, FILTER, or CHECK details of a place to stay.
-        - User mentions specific facilities like "Spa" or "Pool" in a search context.
+        DOMAIN: Lodging and Accommodation.
+        
+        AUTHORITY: Primary skill when the main subject of the interaction is an establishment 
+        intended for staying or sleeping (Hotels, Resorts, Villas, etc.). 
+        It owns all queries regarding their specific services, features, and availability.
         """
 
         logger.info("Skill: Concierge")
@@ -259,16 +254,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
     @chatbot.skill
     async def gastro_guide(ctx: Context, engine: Engine):
         """
-        Authority on Gastronomy, Prepared Food Service, and Social Drinking.
-
-        SCOPE:
-        - Discovery: Identifying venues based on **culinary offerings** and **dining experiences** (cravings, cuisine).
-        - Inspection: Details regarding the menu, service quality, and atmosphere of consumption venues.
-        - **Specific Entities**: Handles queries regarding entities defined as **Restaurants, Bars, Cafes, or Paladares**.
-
-        NEGATIVE CONSTRAINTS (Intrinsic Limit):
-        - **Retail & Groceries**: Strictly excludes establishments primarily dedicated to the sale of raw ingredients, packaged goods, or merchandise (e.g., Supermarkets, Liquor Stores, Markets) where immediate on-site service is not the primary function.
-        - **Non-Consumable Infrastructure**: Excludes sleeping quarters or lobby architecture.
+        DOMAIN: Gastronomy, Drink and Food Services.
+        
+        AUTHORITY: Primary skill when the main subject is an establishment dedicated 
+        to food or drink consumption (Restaurants, Bars, Paladares). 
+        It owns queries regarding culinary offerings and dining environments.
         """
         logger.info("Skill: GastroGuideSkill triggered")
 
@@ -420,13 +410,12 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.skill
     async def location_manager(ctx: Context, engine: Engine):
-        """Manager of User's Current Geographical Presence.
-
-        This skill is strictly responsible for maintaining and updating the user's
-        active origin point within the administrative system (Location, Municipality, Province).
-
-        RESPONSIBILITY:
-        - Origin State: Calibrating the 'start point' for all spatial reasoning.
+        """
+        DOMAIN: Spatial Relations and Multi-Entity Plans.
+        
+        AUTHORITY: This domain activates when the user intent focuses on the NEXUS or 
+        CONNECTION between two or more points (e.g., "A near B", "Route from A to B"). 
+        It is responsible for the relationship between entities, regardless of their type.
         """
 
         logger.info("Skill: LocationManagerSkill")
@@ -434,16 +423,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
     @chatbot.skill
     async def casual_chat(ctx: Context, engine: Engine):
         """
-        The Social & Cultural Persona (Non-Transactional).
-
-        SCOPE:
-        - Purely conversational interactions (Greetings, Small talk).
-        - Historical or Cultural knowledge (Abstract facts, Traditions).
-
-        NEGATIVE CONSTRAINTS (Strict Exclusion):
-        - **NO Commercial Search**: Explicitly FORBIDDEN from handling requests to find, filter, or book physical establishments.
-        - **NO Service Specs**: Do not handle questions about prices, menus, or amenities (WiFi, Pool, Spa).
-        - If the query implies a need for a service or a specific place to go, yield to the specialized skill.
+        DOMAIN: General Knowledge and Social Interaction.
+        
+        AUTHORITY: Handles all subjects that do not have a specific commercial entity 
+        as the main subject and do not imply a relational plan. This includes 
+        history, general facts (monuments, culture), greetings, and politeness.
         """
 
         logger.info("Skill: CasualSkill")
