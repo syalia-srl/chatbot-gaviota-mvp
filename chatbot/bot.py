@@ -66,35 +66,38 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.skill
     async def city_explorer(ctx: Context, engine: Engine):
-        """Architect of Urban Experiences and Trip Planning.
+        """
+        Architect of Itineraries and Spatial Logic within the Hospitality Network.
 
-        This skill is responsible for the logistics of discovery and the organization
-        of time and space. It uses the administrative hierarchy (Location, Municipality,
-        Province) to structure plans and find nearby options.
+        DATA BOUNDARY:
+        - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
 
         RESPONSIBILITY:
-        - Planning: Crafting itineraries and logical sequences of activities.
-        - Spatial Discovery: Navigating the territory to connect the user with places
-        based on their relative position and regional context.
+        - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
+        - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
+
+        NEGATIVE CONSTRAINTS (Intrinsic Limit):
+        - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
+        - **Item Specs**: Does not handle menus or room prices (Micro-level data).
         """
 
         logger.info("Skill: CityExplorerSkill")
 
     @chatbot.skill
     async def concierge(ctx: Context, engine: Engine):
-        """Authority on the Hospitality and Accommodation Domain.
-
-        This skill owns the entire lifecycle of hotel-related interactions.
-        It is the ONLY skill authorized to discuss establishments that provide lodging.
-
-        SCOPE OF ACTION:
-        - Discovery: Finding options based on broad or specific criteria.
-        - Inspection: Providing deep details, history, or specific facts about any named hotel.
-        - Comparison: Analyzing differences between multiple lodging options.
-
-        If the user mentions a Hotel name, even for a historical or casual question,
-        THIS skill must handle it.
         """
+        Specialist in ACCOMMODATION LOGISTICS and HOSPITALITY ASSETS.
+
+        DOMAIN AUTHORITY:
+        - **Lodging**: Sole responsibility for any query related to sleeping, staying, or booking rooms (Hotels, Resorts, Hostels, Campismos).
+        - **Establishment Features**: Handles queries about amenities (Pools, Spas, Wifi) within a lodging context.
+        - **Commercial Entities**: Identifies and processes specific hospitality brands or chains mentioned by the user.
+
+        TRIGGERS:
+        - User wants to FIND, FILTER, or CHECK details of a place to stay.
+        - User mentions specific facilities like "Spa" or "Pool" in a search context.
+        """
+
         logger.info("Skill: Concierge")
 
         search_tool = next(
@@ -255,19 +258,17 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.skill
     async def gastro_guide(ctx: Context, engine: Engine):
-        """Authority on Culinary Experiences, Dining, and Food Establishments.
+        """
+        Authority on Gastronomy, Prepared Food Service, and Social Drinking.
 
-        This skill owns the vertical of "Gastronomy" and "Food Service Operations".
+        SCOPE:
+        - Discovery: Identifying venues based on **culinary offerings** and **dining experiences** (cravings, cuisine).
+        - Inspection: Details regarding the menu, service quality, and atmosphere of consumption venues.
+        - **Specific Entities**: Handles queries regarding entities defined as **Restaurants, Bars, Cafes, or Paladares**.
 
-        SCOPE OF ACTION:
-        - Discovery: Finding places to eat based on cravings, cuisine type, or vibe.
-        - Refinement: Filtering dining options by price, payment methods, or location.
-        - Inspection: Menus, food quality, and specific details of dining venues.
-        - Hotel Dining: AUTHORIZED to handle the **Food & Beverage units** located within hotels.
-
-        EXCLUSION (Out of Scope):
-        - **Accommodation & Lodging**: Strictly excludes questions about staying overnight, room booking, or check-in processes.
-        - **Non-Culinary Infrastructure**: Queries regarding an establishment's architecture, general history, or amenities that serve a function other than dining (e.g., pools, lobby, reception) are REJECTED.
+        NEGATIVE CONSTRAINTS (Intrinsic Limit):
+        - **Retail & Groceries**: Strictly excludes establishments primarily dedicated to the sale of raw ingredients, packaged goods, or merchandise (e.g., Supermarkets, Liquor Stores, Markets) where immediate on-site service is not the primary function.
+        - **Non-Consumable Infrastructure**: Excludes sleeping quarters or lobby architecture.
         """
         logger.info("Skill: GastroGuideSkill triggered")
 
@@ -313,108 +314,108 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 f"Gastro - Intent: {intent.search_query} | Scope: {intent.context_scope}"
             )
 
-        # 3. EJECUCIÓN INICIAL DE BÚSQUEDA (Explícita)
-        # Igual que en Concierge: búsqueda primaria fuera del bucle pasando argumentos explícitos.
-        logger.info("Gastro - Primary Search Step")
+            # 3. EJECUCIÓN INICIAL DE BÚSQUEDA (Explícita)
+            # Igual que en Concierge: búsqueda primaria fuera del bucle pasando argumentos explícitos.
+            logger.info("Gastro - Primary Search Step")
 
-        search_limit = 15
+            search_limit = 15
 
-        search_output = await engine.invoke(
-            ctx, search_tool, description_query=intent.search_query, limit=search_limit
-        )
-
-        if search_output.error:
-            ctx.append(Message.system(f"Search Error: {search_output.error}"))
-            return
-
-        # Preferencia: leer 'restaurants' (o 'results' como fallback)
-        current_restaurant_list = search_output.result.get(
-            "restaurants", []
-        ) or search_output.result.get("results", [])
-
-        ctx.append(Message.system(f"DATABASE_RESULTS: {str(search_output.result)}"))
-
-        # 4. Bucle de Refinamiento (Implícito)
-        ref_tools = [t for t in [details_tool, filter_tool] if t]
-
-        def clean_desc(t):
-            return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
-
-        tool_options = {clean_desc(t): t for t in ref_tools}
-        EXIT_OPTION = "REPLY: Have enough info to answer the user."
-        choice_options = list(tool_options.keys()) + [EXIT_OPTION]
-
-        step = 0
-        max_steps = 3
-
-        while step < max_steps:
-            list_size = len(current_restaurant_list)
-            data_state_note = ""
-
-            # Estado de Memoria
-            if step == 0:
-                if intent.context_scope == ContextScope.RESET:
-                    data_state_note = "MEMORY STATUS: INVALID (New Topic). Current items are fresh from the new search."
-                elif intent.context_scope == ContextScope.ISOLATED:
-                    data_state_note = "MEMORY STATUS: BYPASS (Specific Entity). User wants details of a specific place, not a list."
-                else:
-                    data_state_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be refined."
-            else:
-                data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
-
-            # Prompt de Decisión
-            decision_prompt = f"""
-            OPERATIONAL CONTEXT:
-            - Goal: "{intent.search_query}"
-            - Memory Status: {data_state_note}
-
-            TOOLBOX (Refinement & Inspection):
-            {list(tool_options.keys())}
-            
-            TASK: 
-            Select the optimal tool to process the current data towards the Goal.
-            If the current list is sufficient or the answer is clear, choose REPLY.
-            """
-
-            choice = await engine.choose(
-                ctx, choice_options, Message.system(decision_prompt)
+            search_output = await engine.invoke(
+                ctx, search_tool, description_query=intent.search_query, limit=search_limit
             )
 
-            if choice == EXIT_OPTION:
-                logger.info("Gastro - Decision: Reply to user")
-                break
+            if search_output.error:
+                ctx.append(Message.system(f"Search Error: {search_output.error}"))
+                return
 
-            selected_tool = tool_options.get(choice)
-            if selected_tool:
-                logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
+            # Preferencia: leer 'restaurants' (o 'results' como fallback)
+            current_restaurant_list = search_output.result.get(
+                "restaurants", []
+            ) or search_output.result.get("results", [])
 
-                # EJECUCIÓN IMPLÍCITA (Igual que Concierge)
-                # No pasamos 'user_criteria' ni 'restaurant_name' manualmente.
-                # Confiamos en que el engine extraiga esos argumentos del contexto.
-                output = await engine.invoke(
-                    ctx, selected_tool, current_results=current_restaurant_list
+            ctx.append(Message.system(f"DATABASE_RESULTS: {str(search_output.result)}"))
+
+            # 4. Bucle de Refinamiento (Implícito)
+            ref_tools = [t for t in [details_tool, filter_tool] if t]
+
+            def clean_desc(t):
+                return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
+
+            tool_options = {clean_desc(t): t for t in ref_tools}
+            EXIT_OPTION = "REPLY: Have enough info to answer the user."
+            choice_options = list(tool_options.keys()) + [EXIT_OPTION]
+
+            step = 0
+            max_steps = 3
+
+            while step < max_steps:
+                list_size = len(current_restaurant_list)
+                data_state_note = ""
+
+                # Estado de Memoria
+                if step == 0:
+                    if intent.context_scope == ContextScope.RESET:
+                        data_state_note = "MEMORY STATUS: INVALID (New Topic). Current items are fresh from the new search."
+                    elif intent.context_scope == ContextScope.ISOLATED:
+                        data_state_note = "MEMORY STATUS: BYPASS (Specific Entity). User wants details of a specific place, not a list."
+                    else:
+                        data_state_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be refined."
+                else:
+                    data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
+
+                # Prompt de Decisión
+                decision_prompt = f"""
+                OPERATIONAL CONTEXT:
+                - Goal: "{intent.search_query}"
+                - Memory Status: {data_state_note}
+
+                TOOLBOX (Refinement & Inspection):
+                {list(tool_options.keys())}
+                
+                TASK: 
+                Select the optimal tool to process the current data towards the Goal.
+                If the current list is sufficient or the answer is clear, choose REPLY.
+                """
+
+                choice = await engine.choose(
+                    ctx, choice_options, Message.system(decision_prompt)
                 )
 
-                if output.error:
-                    logger.warning(f"Gastro - Tool Error: {output.error}")
-                    ctx.append(Message.system(f"Tool Error: {output.error}"))
-                else:
-                    # Manejo del resultado
-                    if intent.context_scope == ContextScope.ISOLATED:
-                        header = f"SPECIFIC ENTITY DATA"
-                        ctx.append(Message.system(f"[{header}]: {str(output.result)}"))
-                        step += 1
-                        continue
+                if choice == EXIT_OPTION:
+                    logger.info("Gastro - Decision: Reply to user")
+                    break
+
+                selected_tool = tool_options.get(choice)
+                if selected_tool:
+                    logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
+
+                    # EJECUCIÓN IMPLÍCITA (Igual que Concierge)
+                    # No pasamos 'user_criteria' ni 'restaurant_name' manualmente.
+                    # Confiamos en que el engine extraiga esos argumentos del contexto.
+                    output = await engine.invoke(
+                        ctx, selected_tool, current_results=current_restaurant_list
+                    )
+
+                    if output.error:
+                        logger.warning(f"Gastro - Tool Error: {output.error}")
+                        ctx.append(Message.system(f"Tool Error: {output.error}"))
                     else:
-                        header = f"REFINED LIST"
-                        current_restaurant_list = output.result.get(
-                            "results", []
-                        ) or output.result.get("restaurants", [])
-                        ctx.append(Message.system(f"[{header}]: {str(output.result)}"))
+                        # Manejo del resultado
+                        if intent.context_scope == ContextScope.ISOLATED:
+                            header = f"SPECIFIC ENTITY DATA"
+                            ctx.append(Message.system(f"[{header}]: {str(output.result)}"))
+                            step += 1
+                            continue
+                        else:
+                            header = f"REFINED LIST"
+                            current_restaurant_list = output.result.get(
+                                "results", []
+                            ) or output.result.get("restaurants", [])
+                            ctx.append(Message.system(f"[{header}]: {str(output.result)}"))
 
-            step += 1
+                step += 1
 
-        msg = await engine.reply(ctx)
+            msg = await engine.reply(ctx)
         ctx.append(msg)
 
     @chatbot.skill
@@ -432,16 +433,17 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.skill
     async def casual_chat(ctx: Context, engine: Engine):
-        """Bot Persona, Cultural Knowledge, and Etiquette.
+        """
+        The Social & Cultural Persona (Non-Transactional).
 
-        Use this skill for:
-        - Greetings and helper explanations.
-        - General questions about Cuban culture, history, traditions, and geography.
-        - Information about **public landmarks** and **historical sites** (e.g., monuments, squares, streets) that are NOT commercial businesses.
+        SCOPE:
+        - Purely conversational interactions (Greetings, Small talk).
+        - Historical or Cultural knowledge (Abstract facts, Traditions).
 
-        EXCLUSION RULE (Do Not Handle):
-        - If the user asks about a **Hotel, Hostel, Restaurant, Bar, or Paladar** (even if it is historical), you must yield to the specialist skill.
-        - You do not handle entities that provide lodging or dining services.
+        NEGATIVE CONSTRAINTS (Strict Exclusion):
+        - **NO Commercial Search**: Explicitly FORBIDDEN from handling requests to find, filter, or book physical establishments.
+        - **NO Service Specs**: Do not handle questions about prices, menus, or amenities (WiFi, Pool, Spa).
+        - If the query implies a need for a service or a specific place to go, yield to the specialized skill.
         """
 
         logger.info("Skill: CasualSkill")
@@ -690,7 +692,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
     async def filter_restaurants(
         ctx: Context,
         engine: Engine,
-        current_results: List,
+        current_results: List[Dict[str, Any]],
         user_criteria: str,
     ) -> dict:
         """
@@ -729,23 +731,23 @@ def build(username: str, conversation: Conversation) -> Lingo:
             # Mapeo Semántico: El LLM elige de la lista oficial basándose en el significado
             target_provinces: List[str] = Field(
                 default=[],
-                description=f"Match user location to: {available_context['provinces']}",
+                description="List of provinces to match from the available options provided in context.",
             )
             target_municipalities: List[str] = Field(
                 default=[],
-                description=f"Match user location to: {available_context['municipalities']}",
+                description="List of municipalities to match.",
             )
             target_cuisines: List[str] = Field(
                 default=[],
-                description=f"Match food type to: {available_context['cuisines']}",
+                description="List of cuisines to match.",
             )
             target_services: List[str] = Field(
                 default=[],
-                description=f"Match service style (e.g. 'breakfast', 'buffet') to: {available_context['services']}",
+                description="List of service types to match.",
             )
             target_payments: List[str] = Field(
                 default=[],
-                description=f"Match payment needs to: {available_context['payments']}",
+                description="List of payment options to match.",
             )
 
             # Lógica Numérica: El LLM extrae el número, nosotros parseamos el texto del DB
@@ -849,7 +851,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         ctx: Context,
         engine: Engine,
         restaurant_name: str,
-        current_results: List,
+        current_results: List[Dict[str, Any]],
     ) -> dict:
         """
         Gets the full JSON record for a specific restaurant by name using fuzzy matching.
@@ -859,7 +861,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         if not current_results:
             return {
                 "error": "The current result list is empty. Cannot inspect details.",
-                "suggestion": "Perform a search first to populate the list."
+                "suggestion": "Perform a search first to populate the list.",
             }
 
         # 1. Normalización Semántica (Usando la clase compartida NameTranslation)
