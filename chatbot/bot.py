@@ -279,6 +279,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
             return
 
         # 2. Análisis de Intención
+        msg = None
+        
         with ctx.fork():
             intent_prompt = """
             Analyze the USER'S LAST MESSAGE relative to the conversation history within the DINING domain.
@@ -308,23 +310,37 @@ def build(username: str, conversation: Conversation) -> Lingo:
             # Igual que en Concierge: búsqueda primaria fuera del bucle pasando argumentos explícitos.
             logger.info("Gastro - Primary Search Step")
 
-            search_limit = 15
-
+            current_restaurant_list = []
+            search_limit = 10
+            limit_prompt = """
+            Analyze the user's request for quantities.
+            
+            TASK: Identify the 'Search Universe Size' (Total items to retrieve initially).
+            
+            SCENARIO 1: "Get 10 restaurants" -> quantity=10
+            SCENARIO 2: "Get 10 restaurants, and 2 of them with italian cuisine" -> quantity=10 (Because we need 10 candidates to find the 2 with italian cuisine).
+            SCENARIO 3: "Give me a couple of options" -> quantity=3 (Implied).
+            
+            RULE: If multiple numbers exist, choose the one referring to the TOTAL LIST SIZE or CANDIDATE POOL, not the subset constraints.
+            """
+            limit_data = await engine.create(
+                ctx, SearchLimit, Message.system(limit_prompt)
+            )
+            search_limit = limit_data.quantity if limit_data.quantity else 10
+            if search_limit < 5:
+                search_limit = 5
             search_output = await engine.invoke(
                 ctx, search_tool, description_query=intent.search_query, limit=search_limit
             )
 
             if search_output.error:
                 ctx.append(Message.system(f"Search Error: {search_output.error}"))
-                return
-
-            # Preferencia: leer 'restaurants' (o 'results' como fallback)
-            current_restaurant_list = search_output.result.get(
-                "restaurants", []
-            ) or search_output.result.get("results", [])
-
-            ctx.append(Message.system(f"DATABASE_RESULTS: {str(search_output.result)}"))
-
+            else:
+                current_restaurant_list = search_output.result.get("restaurants", [])
+                ctx.append(
+                    Message.system(f"DATABASE_RESULTS: {str(search_output.result)}")
+                )    
+            
             # 4. Bucle de Refinamiento (Implícito)
             ref_tools = [t for t in [details_tool, filter_tool] if t]
 
@@ -357,7 +373,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 decision_prompt = f"""
                 OPERATIONAL CONTEXT:
                 - Goal: "{intent.search_query}"
-                - Memory Status: {data_state_note}
+                {data_state_note}
 
                 TOOLBOX (Refinement & Inspection):
                 {list(tool_options.keys())}
@@ -378,10 +394,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 selected_tool = tool_options.get(choice)
                 if selected_tool:
                     logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
-
-                    # EJECUCIÓN IMPLÍCITA (Igual que Concierge)
-                    # No pasamos 'user_criteria' ni 'restaurant_name' manualmente.
-                    # Confiamos en que el engine extraiga esos argumentos del contexto.
+                    print(ctx)
                     output = await engine.invoke(
                         ctx, selected_tool, current_results=current_restaurant_list
                     )
@@ -425,9 +438,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
         """
         DOMAIN: General Knowledge and Social Interaction.
         
-        AUTHORITY: Handles all subjects that do not have a specific commercial entity 
-        as the main subject and do not imply a relational plan. This includes 
-        history, general facts (monuments, culture), greetings, and politeness.
+        AUTHORITY: Handles all subjects that are not related to hotels or similar, 
+        also no related to restaurants, bars or similar.
         """
 
         logger.info("Skill: CasualSkill")
@@ -453,8 +465,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         user_criteria: str,
     ) -> dict:
         """
-        Refines the hotel list by mapping user intent to the unique metadata values
-        present in the current dataset.
+        Finds hotels based on a natural language description, craving, or vibe.
         """
         logger.info("Using tool: filter_hotels")
         if not current_results:
@@ -562,12 +573,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
     async def get_hotel_details(
         ctx: Context,
         engine: Engine,
-        hotel_name: str,
         current_results: List[Dict[str, Any]],
+        hotel_name: str,
     ) -> dict:
         """
-        Retrieves full hotel data by resolving the name semantically into the database's
-        native language and then performing a high-precision dual fuzzy match.
+        Gets the full information for a specific hotel by name.
         """
 
         logger.info("Using tool: get_hotel_details")
@@ -576,7 +586,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 "error": "The current result list is empty. Cannot inspect details."
             }
 
-        database_sample = sorted(list({h["name"] for h in current_results[:10]}))
+        database_sample = sorted(list({h["name"] for h in current_results}))
 
         prompt = f"""
         USER INPUT: "{hotel_name}"
@@ -635,11 +645,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
     ) -> dict:
         """
         Finds restaurants based on a natural language description, craving, or vibe.
-
-        Args:
-            description_query: The craving (e.g., "romantic italian dinner", "cheap tacos", "live music").
-            municipality: Optional municipality (kept for signature compatibility, ignored in logic).
-            limit: Max results to return (default 15).
         """
         logger.info(
             f"Tool: search_restaurants_by_description | Query: '{description_query}'"
@@ -656,7 +661,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
             item = doc[0].body.copy()
             if item.get("name"):
                 results.append(item)
-
         # 2. Nota de Sistema Estandarizada (Homogénea con Hoteles)
         # Mantenemos la estructura exacta de instrucción para el LLM.
         # Solo adaptamos los ejemplos entre paréntesis (stars -> price/payment).
@@ -834,11 +838,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
     async def get_restaurant_details(
         ctx: Context,
         engine: Engine,
-        restaurant_name: str,
         current_results: List[Dict[str, Any]],
+        restaurant_name: str,
     ) -> dict:
         """
-        Gets the full JSON record for a specific restaurant by name using fuzzy matching.
+        Gets the full information for a specific restaurant by name.
         """
         logger.info(f"Using tool: get_restaurant_details | Target: '{restaurant_name}'")
 
@@ -850,20 +854,19 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         # 1. Normalización Semántica (Usando la clase compartida NameTranslation)
         # Tomamos una muestra de nombres reales para dar contexto al LLM
-        database_sample = sorted(
-            list({str(r.get("name", "Unknown")) for r in current_results[:10]})
-        )
+        database_sample = sorted(list({h["name"] for h in current_results}))
 
         prompt = f"""
         USER INPUT: "{restaurant_name}"
         DATABASE NAME SAMPLES: {database_sample}
         
         TASK: 
-        Normalize or adapt the USER INPUT to the naming convention used in the DATABASE NAME SAMPLES.
+        Translate or adapt the USER INPUT to the naming convention used in the DATABASE NAME SAMPLES.
         If the user uses a nickname (e.g., "El Floridita"), map it to the formal name if possible.
         
         INSTRUCTION:
         - Respond ONLY with the translated/mapped name string.
+        - Example: If input is "Parque Central" and samples are in English, return "Central Park".
         """
 
         # Usamos la clase NameTranslation definida en el scope general
