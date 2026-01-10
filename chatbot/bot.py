@@ -56,6 +56,30 @@ def build(username: str, conversation: Conversation) -> Lingo:
         similarity = SequenceMatcher(None, s_actual, s_target).ratio()
         return similarity >= threshold
 
+    def check_any_match(item_val: Any, target_list: List[str]) -> bool:
+        if not target_list: return False 
+        if not item_val: return False
+        values = item_val if isinstance(item_val, list) else [item_val]
+        return any(is_fuzzy_match(str(v), t) for v in values for t in target_list)
+
+    def check_text_match(full_text: str, keywords: List[str]) -> bool:
+        if not keywords: return False
+        return any(kw.lower() in full_text for kw in keywords)
+    
+    def count_matches(item_val: Any, target_list: List[str]) -> int:
+        if not target_list or not item_val: return 0
+        
+        # Normalizamos a lista siempre
+        values = item_val if isinstance(item_val, list) else [item_val]
+        count = 0
+        
+        # Iteramos targets para ver si están presentes en los valores del item
+        for target in target_list:
+            # Usamos la función is_fuzzy_match que ya tienes definida en el scope
+            if any(is_fuzzy_match(str(v), target) for v in values):
+                count += 1
+        return count
+
     class SearchLimit(BaseModel):
         """Structure to extract the exact quantity of results requested."""
 
@@ -394,7 +418,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
             step = 0
             max_steps = 3
-            last_choice_exact_text = None
+            execution_trace = []
 
             while step < max_steps:
                 list_size = len(current_restaurant_list)
@@ -410,23 +434,32 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 else:
                     data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
 
-                previous_action_note = ""
-                if last_choice_exact_text:
-                    previous_action_note = f"LAST ACTION PERFORMED: {last_choice_exact_text} in response to this GOAL: {intent.search_query}"
-
+                history_block = ""
+                if execution_trace:
+                    history_str = "\n".join([f"- {item}" for item in execution_trace])
+                    history_block = f"""
+                    --- EXECUTION HISTORY (Actions already completed) ---
+                    {history_str}
+                    -----------------------------------------------------
+                    CRITICAL INSTRUCTION: 
+                    1. Do NOT repeat an action listed above unless the parameters (entity/criteria) are different.
+                    2. If the HISTORY confirms the user's GOAL is already processed (e.g. "Action Taken: Processed 'pizza'"), DO NOT FILTER AGAIN.
+                    3. If the GOAL asks for multiple items (e.g. "A and B") and HISTORY only shows "A", proceed to get "B".
+                    """
+                
                 decision_prompt = f"""
                 GOAL: "{intent.search_query}"
                 {data_state_note}
-                {previous_action_note}
+                
+                {history_block}
                 
                 AVAILABLE TOOLS:
                 {list(tool_options.keys())}
                 
                 DECISION PROTOCOL:
-                1. Review the LAST ACTION, GOAL and the MEMORY STATUS.
-                2. If the current data is sufficient to answer, select the Reply option.
-                3. If you need MORE info (e.g., details for a DIFFERENT item), select the appropriate tool.
-                4. AVOID REPETITION: Do not re-run the LAST ACTION unless you are pursuing a different GOAL.
+                Analyze the GOAL vs the EXECUTION HISTORY.
+                - If the goal requires information NOT present in history, select the tool.
+                - If the goal is met based on the history, select the Reply option.
                 """
                 
                 logger.info(f"Gastro - Selecting tool")
@@ -456,8 +489,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         active_results.reset(token_res)
                         
                     if output and not output.error:
+                        summary = output.result.get("tool_execution_summary", f"Executed tool {selected_tool.name}")
+                        execution_trace.append(summary)
                         current_restaurant_list = output.result.get("results", [])
                         ctx.append(Message.system(f"TOOL_OUTPUT: {str(output.result)}"))
+                        print(f"TOOL_OUTPUT: {str(output.result)}")
                     elif output:
                         logger.error(f"Tool Error: {output.error}")
                         ctx.append(Message.system(f"System Error: {output.error}"))
@@ -468,7 +504,10 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
                 step += 1
 
-            msg = await engine.reply(ctx)
+            msg = await engine.reply(ctx, intent.search_query)
+        
+        
+        
         ctx.append(msg)
 
     @chatbot.skill
@@ -490,6 +529,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         AUTHORITY: Handles all subjects that are not related to hotels or similar,
         also no related to restaurants, bars or similar.
+        
+        EXCLUSION: Never response with information related to restaurants, bars, hotels, hostals or related type of
         """
 
         logger.info("Skill: CasualSkill")
@@ -788,10 +829,10 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.tool
     async def filter_restaurants(
-        current_results: List[Dict[str, Any]], user_criteria: str, **kwargs
+        user_criteria: str, **kwargs
     ) -> dict:
         """
-        Refines the restaurant list using semantic mapping for categories and numerical parsing for prices.
+        Refines the restaurant using semantic mapping for categories like its location, type of cuisines, services offered, payment methods, budget, house specialties.
         """
         logger.info(f"Using tool  filter_restaurants | Criteria: {user_criteria}")
 
@@ -832,83 +873,62 @@ def build(username: str, conversation: Conversation) -> Lingo:
             "payments": get_unique_from_list("payment_options"),
         }
         class RestaurantFilters(BaseModel):
-            target_provinces: List[str] = Field(
-                default=[],
-                description="List of provinces to match from the available options provided in context.",
-            )
-            target_municipalities: List[str] = Field(
-                default=[],
-                description="List of municipalities to match.",
-            )
-            target_cuisines: List[str] = Field(
-                default=[],
-                description="List of cuisines to match.",
-            )
-            target_services: List[str] = Field(
-                default=[],
-                description="List of service types to match.",
-            )
-            target_payments: List[str] = Field(
-                default=[],
-                description="List of payment options to match.",
-            )
+            # LOCATION
+            target_provinces: List[str] = Field(default=[], description="Provinces to INCLUDE.")
+            excluded_provinces: List[str] = Field(default=[], description="Provinces to EXCLUDE.")
+            
+            target_municipalities: List[str] = Field(default=[], description="Municipalities to INCLUDE.")
+            excluded_municipalities: List[str] = Field(default=[], description="Municipalities to EXCLUDE.")
 
-            max_budget_usd: Optional[float] = Field(
-                None,
-                description="Max price per person in USD extracted from user request.",
-            )
+            # CUISINE
+            target_cuisines: List[str] = Field(default=[], description="Cuisines to INCLUDE.")
+            excluded_cuisines: List[str] = Field(default=[], description="Cuisines to EXCLUDE.")
 
-            specialty_keywords: List[str] = Field(
-                default=[],
-                description="Keywords/Synonyms for the specific dish/specialty requested (e.g. user: 'pork' -> ['cerdo', 'lechón', 'pork']).",
-            )
+            # SERVICES & PAYMENTS
+            target_services: List[str] = Field(default=[], description="Services to INCLUDE.")
+            excluded_services: List[str] = Field(default=[], description="Services to EXCLUDE.")
+            
+            target_payments: List[str] = Field(default=[], description="Payment methods to INCLUDE.")
+            excluded_payments: List[str] = Field(default=[], description="Payment methods to EXCLUDE.")
+
+            # KEYWORDS (Catch-all)
+            specialty_keywords: List[str] = Field(default=[], description="Positive keywords for dishes/vibes not in lists.")
+            excluded_keywords: List[str] = Field(default=[], description="Negative keywords to avoid.")
+
+            # BUDGET
+            max_budget_usd: Optional[float] = Field(None, description="Max price limit per person.")
 
         filter_prompt = f"""
-        ROLE: You are an expert semantic extraction engine for a restaurant discovery app.
-        
+        ROLE: Expert semantic extraction for restaurant filtering.
         USER QUERY: "{user_criteria}"
         
-        --- SOURCE OF TRUTH (AVAILABLE OPTIONS) ---
-        Use ONLY these exact strings for matching. Do not invent new categories.
+        SOURCE DATA (Valid values for mapping):
         - PROVINCES: {available_context['provinces']}
         - MUNICIPALITIES: {available_context['municipalities']}
         - CUISINES: {available_context['cuisines']}
         - SERVICES: {available_context['services']}
         - PAYMENTS: {available_context['payments']}
         
-        --- EXTRACTION RULES (Field by Field) ---
+        --- CRITICAL RULES ---
         
-        1. target_provinces & target_municipalities:
-           - EXTRACT ONLY if the user explicitly mentions a location (e.g., "in Havana", "near Vedado").
-           - Map fuzzy terms to the list (e.g., "Havana" -> "La Habana").
-           - If no location is mentioned, MUST BE EMPTY [].
-           
-        2. target_cuisines:
-           - EXTRACT specific food categories requested (e.g., "Italian", "Chinese").
-           - INFER implied cuisines (e.g., "Pizza" -> "Italian", "Sushi" -> "Japanese").
-           - If user says "places to eat" or "restaurants", MUST BE EMPTY [].
-           
-        3. target_services:
-           - EXTRACT service requirements (e.g., "delivery", "takeout", "buffet", "air conditioning").
-           - Match against the 'SERVICES' list.
-           
-        4. target_payments:
-           - EXTRACT ONLY if the user mentions payment constraints (e.g., "accepts credit cards", "pay in USD").
-           - Match against 'PAYMENTS' list (e.g., "VISA", "Cash (USD)").
-           
-        5. max_budget_usd:
-           - EXTRACT numerical max price if stated (e.g., "under 20 dollars", "cheap").
-           - Convert to float. If "cheap", estimate ~10.0. If "expensive", ignore.
-           
-        6. specialty_keywords:
-           - EXTRACT specific dishes, ingredients, or vibes NOT covered by Cuisine.
-           - Examples: "lobster", "romantic", "live music", "view", "pork", "hamburgers".
-           - Include synonyms (e.g., User: "pork" -> Keywords: ["pork", "cerdo", "lechón"]).
+        1. **EXPLICITNESS IS MANDATORY**: 
+           - ONLY extract filters that are EXPLICITLY mentioned or strongly implied in the USER QUERY.
+           - IF the user did NOT mention a specific location (Province/Municipality), usually leave those lists EMPTY.
+           - DO NOT guess or select random values from SOURCE DATA.
+        
+        2. **STANDARD MAPPING**: 
+           - Map explicit keywords to the EXACT strings in SOURCE DATA.
+           - Query: "in Vedado" -> target_municipalities=['Plaza de la Revolución'] (if Vedado maps there) or matches directly.
+           - Query: "Italian food" -> target_cuisines=['Italian'].
+           - Query: "No Pizza" -> excluded_cuisines=['Italian'] (or keyword 'pizza').
 
-        --- ANTI-HALLUCINATION PROTOCOL ---
-        - DEFAULT ALL LISTS TO EMPTY []. 
-        - DO NOT fill a list with all available options just because the user didn't specify. 
-        - STRICT MATCHING: Only select an option from the lists if it matches the user's intent.
+        3. **KEYWORDS**:
+           - Use 'specialty_keywords' for specific dishes like "lobster", "pizza", "fried rice" if they don't perfectly match a Cuisine category.
+           
+        4. **BUDGET**: 
+           - Extract max price only if a number or "cheap"/"expensive" is mentioned.
+        
+        OUTPUT: JSON only.
         """
         logger.info(f"filter_restaurants - Getting filters")
         
@@ -917,111 +937,122 @@ def build(username: str, conversation: Conversation) -> Lingo:
         )
         logger.info(f"filter_restaurants - Filters Active: {filters.dict()}")
 
+        # Helper para parsear precios
         def parse_price_range(price_str):
-            """Extracts min and max price from string like '$8.00 to $14.00 USD'."""
             if not price_str: return (0, float('inf'))
             nums = re.findall(r"[\d\.]+", str(price_str))
             if not nums: return (0, float('inf'))
-            
-            vals = []
-            for n in nums:
-                try:
-                    vals.append(float(n))
-                except ValueError:
-                    continue
-            
+            vals = [float(n) for n in nums if n.replace('.', '', 1).isdigit()]
             if not vals: return (0, float('inf'))
-            if len(vals) == 1:
-                return (0, vals[0])
-            return (min(vals), max(vals))
-
-        refined = current_results
-        logger.info(f"filter_restaurants - Filtering results of {len(refined)} candidates")
+            return (min(vals), max(vals)) if len(vals) > 1 else (0, vals[0])
         
-        if filters.target_provinces:
-            refined = [
-                r for r in refined 
-                if any(is_fuzzy_match(r.get("province"), target) for target in filters.target_provinces)
-            ]
-
-        if filters.target_municipalities:
-            refined = [
-                r for r in refined 
-                if any(is_fuzzy_match(r.get("municipality"), target) for target in filters.target_municipalities)
-            ]
+        print(current_results)
         
-        for r in refined:
-            r["_budget_status"] = "unknown"
-            r["_budget_priority"] = 1 
+        logger.info(f"filter_restaurants - Filtering results of {len(current_results)} candidates")
+        refined_full_data = []  # Para el sistema (código)
+        ranking_report = []     # Para el razonamiento (LLM)        
+        user_max_budget = float(filters.max_budget_usd) if filters.max_budget_usd is not None else None
+
+        for r in current_results:
+            r_prov = r.get("province")
+            r_muni = r.get("municipality")
+            r_cuisine = r.get("cuisine", [])
+            r_services = r.get("type_of_service", [])
+            r_payment = r.get("payment_options", [])
+            r_addr = r.get("place_details", {}).get("address", "No Address")
+            full_text = (str(r.get("name", "")) + " " + str(r.get("house_specialty", "")) + " " + str(r.get("description", ""))).lower()
+
+            # A. Exclusiones
+            if filters.excluded_provinces and check_any_match(r_prov, filters.excluded_provinces): continue
+            if filters.excluded_municipalities and check_any_match(r_muni, filters.excluded_municipalities): continue
+            if filters.excluded_cuisines and (check_any_match(r_cuisine, filters.excluded_cuisines) or check_text_match(full_text, filters.excluded_cuisines)): continue
+            if filters.excluded_keywords and check_text_match(full_text, filters.excluded_keywords): continue
+
+            # B. Matches (Evidencia)
+            match_log = {} 
+            score_general = 0
+
+            def add_evidence(category, specific_match):
+                nonlocal score_general
+                score_general += 1
+                if category not in match_log:
+                    match_log[category] = []
+                match_log[category].append(specific_match)
+
+            for t in filters.target_cuisines:
+                if is_fuzzy_match(t, r_cuisine) or (t.lower() in full_text): add_evidence("Cuisine_Match", t)
             
-            if filters.max_budget_usd is not None:
-                min_p, max_p = parse_price_range(r.get("average_price", ""))
-                user_budget = float(filters.max_budget_usd)
+            for t in filters.target_services:
+                if is_fuzzy_match(t, r_services) or (t.lower() in full_text): add_evidence("Service_Match", t)
                 
-                if max_p <= user_budget:
-                    r["_budget_status"] = "within_budget"
-                    r["_budget_priority"] = 2 
-                elif min_p <= user_budget:
-                    r["_budget_status"] = "warning" 
-                    r["_budget_priority"] = 1
-                else:
-                    r["_budget_status"] = "over_budget"
-                    r["_budget_priority"] = 0 
-        
-        scored_candidates = []
-        
-        for r in refined:
-            cuisine_score = 0
-            feature_score = 0
-            
-            if filters.target_cuisines:
-                r_cuisines = [str(c) for c in r.get("cuisine", [])]
-                match_found = False
-                for target in filters.target_cuisines:
-                    if any(is_fuzzy_match(rc, target) for rc in r_cuisines):
-                        match_found = True
-                        break
-                if match_found:
-                    cuisine_score = 10 
-            
-            if filters.target_services:
-                r_services = [str(s) for s in r.get("type_of_service", [])]
-                for target in filters.target_services:
-                    if any(is_fuzzy_match(rs, target) for rs in r_services):
-                        feature_score += 1
-            
-            if filters.target_payments:
-                r_payments = [str(p) for p in r.get("payment_options", [])]
-                for target in filters.target_payments:
-                    if any(is_fuzzy_match(rp, target) for rp in r_payments):
-                        feature_score += 1
+            for k in filters.specialty_keywords:
+                if k.lower() in full_text: add_evidence("Keyword_Found", k)
 
-            if filters.specialty_keywords:
-                specialty_text = str(r.get("house_specialty", "")).lower()
-                for kw in filters.specialty_keywords:
-                    if kw.lower() in specialty_text:
-                        feature_score += 1
+            if user_max_budget is not None:
+                min_p, max_p = parse_price_range(r.get("average_price", ""))
+                if min_p > user_max_budget: continue 
+                elif max_p <= user_max_budget: add_evidence("Budget", "Within Limit")
 
-            r["_cuisine_score"] = cuisine_score
-            r["_feature_score"] = feature_score
-            r["_total_match_score"] = cuisine_score + feature_score
+            # C. Construcción Dual
+            has_filters = (filters.target_cuisines or filters.target_services or filters.specialty_keywords or filters.target_payments or user_max_budget)
             
-            scored_candidates.append(r)
-        
-        scored_candidates.sort(
-            key=lambda x: (x.get("_total_match_score", 0), x.get("_budget_priority", 1)), 
-            reverse=True
+            if not has_filters or score_general > 0:
+                # 1. Objeto Completo (Enriquecido)
+                full_item = r.copy() # Copia segura
+                full_item["_RANK_SCORE"] = score_general
+                full_item["_MATCH_LOG"] = match_log
+                refined_full_data.append(full_item)
+                
+                # 2. Objeto Reporte (Minificado para razonamiento)
+                ref_item = {
+                    "name": r.get("name"),
+                    "RANK_SCORE": score_general,
+                    "MATCH_LOG": match_log, 
+                    "ID_LOC": { # Contexto mínimo de ubicación
+                        "mun": r_muni,
+                        "prov": r_prov
+                    }
+                }
+                ranking_report.append(ref_item)
+
+        # 3. Ordenamiento Sincronizado
+        refined_full_data.sort(key=lambda x: x.get("_RANK_SCORE", 0), reverse=True)
+        ranking_report.sort(key=lambda x: x.get("RANK_SCORE", 0), reverse=True)
+
+        # --- 4. RESUMEN Y RETORNO ---
+        top_score = ranking_report[0].get("RANK_SCORE", 0) if ranking_report else 0
+        validation_msg = ""
+        if top_score > 1:
+            validation_msg = "Top items satisfy MULTIPLE criteria."
+        elif top_score == 1:
+            validation_msg = "Top items satisfy at least one criterion."
+        else:
+            validation_msg = "No specific matches found."
+
+        # Directiva Híbrida
+        system_directive = (
+            "SYSTEM INSTRUCTION: "
+            "1. 'ranking_report' contains the LOGIC (Score/Why). Use it to decide WHICH items to recommend. "
+            "2. 'results' contains the FULL DATA (Descriptions/Address). Use it to describe the items. "
+            f"3. {validation_msg} Prioritize items with high Scores."
+        )
+
+        tool_definition = filter_restaurants.__doc__ or "Refines results."
+        tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
+
+        execution_summary = (
+            f"TOOL DEFINITION: [{tool_definition}] | "
+            f"ACTION TAKEN: Applied filtering based on user criteria: '{user_criteria}'. "
+            f"List reduced to {len(refined_full_data)} items. "
         )
         
-        refined = scored_candidates
-        
-        logger.info(f"filter_restaurants - Filtering ended of {len(refined)} results")
+        logger.info(f"filter_restaurants - Summary: {execution_summary}")
 
         return {
-            "count_before": len(current_results),
-            "count_after": len(refined),
-            "active_filters": filters.dict(),
-            "results": refined,
+            "__SYSTEM_DIRECTIVE__": system_directive,
+            "ranking_report": ranking_report, # Para que el LLM entienda la lógica rápido
+            # "results": refined_full_data,     # Para que el Bot y Tools tengan la data completa
+            "tool_execution_summary": execution_summary
         }
 
     @chatbot.tool
@@ -1092,24 +1123,37 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 if score > highest_score:
                     highest_score = score
                     best_match = item
-
+                    
+        tool_definition = get_restaurant_details.__doc__
+        if tool_definition:
+            tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
+        else:
+            tool_definition = "Gets full information for a specific restaurant."
+        
         if best_match and highest_score >= threshold:
-            logger.info(
-                f"Match found: '{best_match.get('name')}' (Score: {highest_score:.2f})"
+            # 2. Resumen de Éxito
+            execution_summary = (
+                f"TOOL DEFINITION: [{tool_definition}] | "
+                f"ACTION TAKEN: Successfully retrieved full details for '{best_match.get('name')}'."
             )
+            
             return {
                 "status": "success",
                 "restaurant": best_match,
-                "match_info": {
-                    "original_query": restaurant_name,
-                    "interpreted_query": translated_name,
-                    "confidence": round(highest_score, 2),
-                },
+                "match_info": { ... },
+                "tool_execution_summary": execution_summary
             }
             
+        # 3. Resumen de Fallo
+        execution_summary = (
+            f"TOOL DEFINITION: [{tool_definition}] | "
+            f"ACTION FAILED: Attempted to find details for '{restaurant_name}' but no match was found in the current list."
+        )
+        
         return {
             "error": f"No reliable match found for '{restaurant_name}' in the current set.",
             "details": "The name could not be resolved semantically or structurally against the active list.",
+            "tool_execution_summary": execution_summary
         }
 
     @chatbot.tool
