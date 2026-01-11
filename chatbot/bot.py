@@ -10,6 +10,7 @@ from enum import Enum
 import logging
 import re
 import contextvars
+import copy
 
 
 logging.basicConfig(
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 active_ctx = contextvars.ContextVar("active_ctx")
 active_engine = contextvars.ContextVar("active_engine")
 active_results = contextvars.ContextVar("active_results")
+active_initial_results = contextvars.ContextVar("active_initial_results")
 
 def build(username: str, conversation: Conversation) -> Lingo:
     config = load()
@@ -65,6 +67,9 @@ def build(username: str, conversation: Conversation) -> Lingo:
     def check_text_match(full_text: str, keywords: List[str]) -> bool:
         if not keywords: return False
         return any(kw.lower() in full_text for kw in keywords)
+    
+    def clean_desc(t):
+        return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
     
     def count_matches(item_val: Any, target_list: List[str]) -> int:
         if not target_list or not item_val: return 0
@@ -338,6 +343,9 @@ def build(username: str, conversation: Conversation) -> Lingo:
         if not search_tool:
             logger.error("GastroGuide - Error: Search tool missing.")
             return
+        
+        mutators = [filter_tool]
+        inspectors = [details_tool]
 
         msg = None
 
@@ -369,7 +377,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
             logger.info("Gastro - Primary Search Step")
 
-            current_restaurant_list = []
             search_limit = 10
             limit_prompt = """
             Analyze the user's request for quantities.
@@ -388,9 +395,12 @@ def build(username: str, conversation: Conversation) -> Lingo:
             )
             search_limit = limit_data.quantity if limit_data.quantity else 10
             if search_limit < 5:
-                search_limit = 5
+                search_limit = 10
+            search_limit = search_limit*2
+            
             logger.info(f"Gastro - Quantity: {search_limit}")
             logger.info(f"Gastro - Searching candidates")
+            
             search_output = await engine.invoke(
                 ctx,
                 search_tool,
@@ -400,17 +410,24 @@ def build(username: str, conversation: Conversation) -> Lingo:
             
             if search_output.error:
                 ctx.append(Message.system(f"Search Error: {search_output.error}"))
+                working_data = [] # Fallback seguro
+                initial_data = []
             else:
-                current_restaurant_list = search_output.result.get("restaurants", [])
+                # 5. Inicialización de Doble Estado (Double State Init)
+                # Normalizamos la llave de salida (soporta 'restaurants' legacy o 'results' estándar)
+                raw_initial_data = search_output.result.get("results", search_output.result.get("restaurants", []))
+                
+                # DEEPCOPY CRÍTICO: Aseguramos que initial_data sea inmutable
+                initial_data = copy.deepcopy(raw_initial_data)
+                working_data = copy.deepcopy(raw_initial_data)
+                
                 ctx.append(
-                    Message.system(f"DATABASE_RESULTS: {str(search_output.result)}")
+                    Message.system(f"CANDIDATES IN JSON FORMAT  : {str(working_data)}")
                 )
-            logger.info(f"Gastro - Candidates: {len(current_restaurant_list)}")
+                
+            logger.info(f"Gastro - Memory Initialized: {len(working_data)} items")
             
-            ref_tools = [t for t in [details_tool, filter_tool] if t]
-
-            def clean_desc(t):
-                return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
+            ref_tools = mutators + inspectors
 
             tool_options = {clean_desc(t): t for t in ref_tools}
             EXIT_OPTION = "REPLY: Have enough info to answer the user."
@@ -419,96 +436,160 @@ def build(username: str, conversation: Conversation) -> Lingo:
             step = 0
             max_steps = 3
             execution_trace = []
+            
+            token_ctx = active_ctx.set(ctx)
+            token_eng = active_engine.set(engine)
+            token_init = active_initial_results.set(initial_data) 
+            token_res = active_results.set(working_data)
 
-            while step < max_steps:
-                list_size = len(current_restaurant_list)
-                data_state_note = ""
+            try:
+                while step < max_steps:
+                    list_size = len(working_data)
+                    # data_state_note = f"DATA STATUS: You have {list_size} active candidates in context."
+                    data_state_note = ""
 
-                if step == 0:
-                    if intent.context_scope == ContextScope.RESET:
-                        data_state_note = "MEMORY STATUS: INVALID (New Topic). Current items are fresh from the new search."
-                    elif intent.context_scope == ContextScope.ISOLATED:
-                        data_state_note = "MEMORY STATUS: BYPASS (Specific Entity). User wants details of a specific place, not a list."
+                    
+                    if step == 0:
+                        if intent.context_scope == ContextScope.RESET:
+                            data_state_note = "MEMORY STATUS: INVALID (New Topic). Current items are fresh from the new search."
+                        elif intent.context_scope == ContextScope.ISOLATED:
+                            data_state_note = "MEMORY STATUS: BYPASS (Specific Entity). User wants details of a specific place, not a list."
+                        else:
+                            data_state_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be refined."
                     else:
-                        data_state_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be refined."
-                else:
-                    data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
+                        data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
 
-                history_block = ""
-                if execution_trace:
-                    history_str = "\n".join([f"- {item}" for item in execution_trace])
-                    history_block = f"""
-                    --- EXECUTION HISTORY (Actions already completed) ---
-                    {history_str}
-                    -----------------------------------------------------
-                    CRITICAL INSTRUCTION: 
-                    1. Do NOT repeat an action listed above unless the parameters (entity/criteria) are different.
-                    2. If the HISTORY confirms the user's GOAL is already processed (e.g. "Action Taken: Processed 'pizza'"), DO NOT FILTER AGAIN.
-                    3. If the GOAL asks for multiple items (e.g. "A and B") and HISTORY only shows "A", proceed to get "B".
+                    # history_block = ""
+                    # if execution_trace:
+                    #     history_str = "\n".join([f"- {item}" for item in execution_trace])
+                    #     history_block = f"""
+                    #     --- EXECUTION HISTORY (Actions already completed) ---
+                    #     {history_str}
+                    #     -----------------------------------------------------
+                    #     CRITICAL INSTRUCTION: 
+                    #     1. Do NOT repeat an action listed above unless the parameters (entity/criteria) are different.
+                    #     2. If the HISTORY confirms the user's GOAL is already processed (e.g. "Action Taken: Processed 'pizza'"), DO NOT FILTER AGAIN.
+                    #     3. If the GOAL asks for multiple items (e.g. "A and B") and HISTORY only shows "A", proceed to get "B".
+                    #     """
+                    
+                    history_block = ""
+                    if execution_trace:
+                        history_str = "\n".join([f"- {item}" for item in execution_trace])
+                        history_block = f"""
+                        --- FULL EXECUTION HISTORY UNTIL NOW (Actions taken) ---
+                        {history_str}
+                        -----------------------------------------
+                        """
+                    
+                    # decision_prompt = f"""
+                    # GOAL: "{intent.search_query}"
+                    # {data_state_note}
+                    
+                    # {history_block}
+                    
+                    # AVAILABLE TOOLS:
+                    # {list(tool_options.keys())}
+                    
+                    # DECISION PROTOCOL:
+                    # Analyze the GOAL vs the EXECUTION HISTORY.
+                    # - If the goal requires information NOT present in history, select the tool.
+                    # - If the goal is met based on the history, select the Reply option.
+                    # """
+                    
+                    decision_prompt = f"""
+                    CURRENT GOAL: "{intent.search_query}"
+                    
+                    {history_block}
+                    
+                    AVAILABLE TOOLS TO DO ACTIONS:
+                    {list(tool_options.keys())}
+                    
+                    DECISION PROTOCOL (Checklist Logic):
+                    
+                    1. DECONSTRUCT THE GOAL:
+                       - Identify from the EXECUTION HISTORY if the GOAL is completed covered and, if not, what actions needs to be done 
+                    
+                    2. SCAN HISTORY FOR COVERAGE:
+                       - Check the entire history. Has *Action A* been done? Has *Action B* been done?
+                       - An action is "COVERED" if ANY line in the history shows it was successfully processed.
+                    
+                    3. DECIDE:
+                       - IF ALL actions needed for the Goal are COVERED in the History -> The task is complete. Select '{EXIT_OPTION}'.
+                       - IF an action is MISSING (not in History) -> Select the tool to address ONLY the missing item.
+                       - CRITICAL: DO NOT repeat an action that is already in the history.
                     """
-                
-                decision_prompt = f"""
-                GOAL: "{intent.search_query}"
-                {data_state_note}
-                
-                {history_block}
-                
-                AVAILABLE TOOLS:
-                {list(tool_options.keys())}
-                
-                DECISION PROTOCOL:
-                Analyze the GOAL vs the EXECUTION HISTORY.
-                - If the goal requires information NOT present in history, select the tool.
-                - If the goal is met based on the history, select the Reply option.
-                """
-                
-                logger.info(f"Gastro - Selecting tool")
+                    
+                    logger.info(f"Gastro - Selecting tool")
 
-                choice = await engine.choose(
-                    ctx, choice_options, Message.system(decision_prompt)
-                )
+                    choice = await engine.choose(
+                        ctx, choice_options, Message.system(decision_prompt)
+                    )
 
-                selected_tool = tool_options.get(choice)
-                if selected_tool:
-                    logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
-                    
-                    last_choice_exact_text = choice                    
-                    
-                    token_ctx = active_ctx.set(ctx)
-                    token_eng = active_engine.set(engine)
-                    token_res = active_results.set(current_restaurant_list)
-                    
-                    try:
-                        output = await engine.invoke(ctx, selected_tool)
-                    except Exception as e:
-                        logger.error(f"EXCEPTION in tool execution: {e}")
-                        output = None 
-                    finally:
-                        active_ctx.reset(token_ctx)
-                        active_engine.reset(token_eng)
-                        active_results.reset(token_res)
+                    selected_tool = tool_options.get(choice)
+                    if selected_tool:
+                        logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
+                        output = None
                         
-                    if output and not output.error:
-                        summary = output.result.get("tool_execution_summary", f"Executed tool {selected_tool.name}")
-                        execution_trace.append(summary)
-                        current_restaurant_list = output.result.get("results", [])
-                        ctx.append(Message.system(f"TOOL_OUTPUT: {str(output.result)}"))
-                        print(f"TOOL_OUTPUT: {str(output.result)}")
-                    elif output:
-                        logger.error(f"Tool Error: {output.error}")
-                        ctx.append(Message.system(f"System Error: {output.error}"))
-                
-                else:
-                    logger.info(f"Gastro - Decision: Reply (Choice: '{choice}')")
-                    break
+                        try:
+                            # Esta es la línea mágica que te faltaba
+                            output = await engine.invoke(ctx, selected_tool)
+                        except Exception as e:
+                            logger.error(f"EXCEPTION in tool execution: {e}")
+                            output = None
+                        
+                        if output and not output.error:
+                                    
+                            # A. MEMORIA (Trace)
+                            summary = output.result.get("tool_execution_summary", f"Executed {selected_tool.name}")
+                            execution_trace.append(summary)
 
-                step += 1
+                            # B. ESTADO (Mutation) - Solo si es Mutator
+                            # Verificación genérica contra la lista, no por nombre.
+                            if selected_tool in mutators:
+                                new_results = output.result.get("results")
+                                if new_results is not None:
+                                    working_data = new_results
+                                    active_results.set(working_data)
+                                    logger.info(f"Gastro - State Mutated. New size: {len(working_data)}")
+
+                            # C. VISUALIZACIÓN (Routing)
+                            
+                            # 1. Reporte (Navegación)
+                            if "report" in output.result:
+                                ctx.append(Message.system(f"NAVIGATION_REPORT: {str(output.result['report'])}"))
+                            
+                            # 2. Payload de Datos (Solo Inspectors)
+                            if selected_tool in inspectors:
+                                payload = output.result.get("results", output.result.get("restaurant"))
+                                if payload:
+                                    ctx.append(Message.system(f"DATA_INSPECTION_PAYLOAD: {str(payload)}"))
+
+                            # 3. Directivas de Sistema
+                            if "__SYSTEM_DIRECTIVE__" in output.result:
+                                ctx.append(Message.system(f"SYSTEM_NOTE: {output.result['__SYSTEM_DIRECTIVE__']}"))
+
+                        elif output:
+                            logger.error(f"Tool Error: {output.error}")
+                            ctx.append(Message.system(f"System Error: {output.error}"))
+                
+                    else:
+                        logger.info(f"Gastro - Decision: Reply (Choice: '{choice}')")
+                        break
+
+                    step += 1
+                
+            finally:
+                # 7. Cierre del Scope (Limpieza Garantizada)
+                active_ctx.reset(token_ctx)
+                active_engine.reset(token_eng)
+                active_initial_results.reset(token_init)
+                active_results.reset(token_res)
 
             msg = await engine.reply(ctx, intent.search_query)
         
-        
-        
         ctx.append(msg)
+        
+        
 
     @chatbot.skill
     async def location_manager(ctx: Context, engine: Engine):
@@ -667,9 +748,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
             
         if not refined:
             logger.warning("Features filter removed all candidates.")
-                
-        print("Results after") 
-        print(refined)
 
         return {
             "total_before": len(current_results),
@@ -845,10 +923,16 @@ def build(username: str, conversation: Conversation) -> Lingo:
             return {"error": "Internal Error: Context missing"}
         if not current_results:
             logger.warning("Aborting because current_results is empty.")
+            empty_summary = (
+                "ACTION ABORTED: Attempted filter but the data is empty. "
+                "No context to search in."
+            )
+            
             return {
-                "results": [],
-                "total": 0,
-                "msg": "No restaurants to filter. The previous search returned 0 results."
+                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: No data. You cannot filter. Ask user to Search first.",
+                "report": {"status": "Error", "msg": "No data available"}, 
+                "results": {},
+                "tool_execution_summary": empty_summary
             }
 
         if not current_results:
@@ -945,9 +1029,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
             vals = [float(n) for n in nums if n.replace('.', '', 1).isdigit()]
             if not vals: return (0, float('inf'))
             return (min(vals), max(vals)) if len(vals) > 1 else (0, vals[0])
-        
-        print(current_results)
-        
+                
         logger.info(f"filter_restaurants - Filtering results of {len(current_results)} candidates")
         refined_full_data = []  # Para el sistema (código)
         ranking_report = []     # Para el razonamiento (LLM)        
@@ -958,8 +1040,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
             r_muni = r.get("municipality")
             r_cuisine = r.get("cuisine", [])
             r_services = r.get("type_of_service", [])
-            r_payment = r.get("payment_options", [])
-            r_addr = r.get("place_details", {}).get("address", "No Address")
+            # r_payment = r.get("payment_options", [])
+            # r_addr = r.get("place_details", {}).get("address", "No Address")
             full_text = (str(r.get("name", "")) + " " + str(r.get("house_specialty", "")) + " " + str(r.get("description", ""))).lower()
 
             # A. Exclusiones
@@ -1043,7 +1125,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         execution_summary = (
             f"TOOL DEFINITION: [{tool_definition}] | "
             f"ACTION TAKEN: Applied filtering based on user criteria: '{user_criteria}'. "
-            f"List reduced to {len(refined_full_data)} items. "
+            # f"List reduced to {len(refined_full_data)} items. "
         )
         
         logger.info(f"filter_restaurants - Summary: {execution_summary}")
@@ -1051,7 +1133,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         return {
             "__SYSTEM_DIRECTIVE__": system_directive,
             "ranking_report": ranking_report, # Para que el LLM entienda la lógica rápido
-            # "results": refined_full_data,     # Para que el Bot y Tools tengan la data completa
+            "results": refined_full_data,     # Para que el Bot y Tools tengan la data completa
             "tool_execution_summary": execution_summary
         }
 
@@ -1070,21 +1152,44 @@ def build(username: str, conversation: Conversation) -> Lingo:
             current_results = active_results.get()
         except LookupError:
             logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
-            return {"error": "Internal Error: Context missing"}
-        if not current_results:
-            logger.warning("Aborting because current_results is empty.")
+            
+            # Resumen: El LLM lee esto en su historial. Debe sonar a "acción fallida".
+            error_summary = "ACTION FAILED: The tool could not access the current list of restaurants due to an internal error."
+            
             return {
-                "details": "Aborting because current results is empty.",
+                # Directiva: Lenguaje natural puro. El "Sistema" le dice al "Agente" que falló.
+                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: The search process failed. The information is currently inaccessible. Apologize to the user.",
+                
+                # Reporte: Estado abstracto
+                "report": {"status": "Failure", "reason": "Data Inaccessible"}, 
+                
+                # Datos: Vacíos
+                "results": {},
+                
+                # Trace
+                "tool_execution_summary": error_summary
+            }
+            
+        if not current_results:
+            logger.warning("get_restaurant_details - Aborting: List is empty.")
+            
+            empty_summary = (
+                "ACTION ABORTED: Attempted to get details but the active list is empty. "
+                "No context to search in."
+            )
+            
+            return {
+                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: No data. You cannot Inspect details. Ask user to Search first.",
+                "report": {"status": "Error", "msg": "No data available"}, 
+                "results": {},
+                "tool_execution_summary": empty_summary
             }
 
-        if not current_results:
-            return {
-                "error": "The current result list is empty. Cannot inspect details.",
-                "suggestion": "Perform a search first to populate the list.",
-            }
-
-        database_sample = sorted(list({h["name"] for h in current_results}))
-
+        database_sample = sorted({
+            h.get("name") for h in current_results 
+            if h.get("name") and str(h.get("name")).strip()
+        })
+        
         prompt = f"""
         USER INPUT: "{restaurant_name}"
         DATABASE NAME SAMPLES: {database_sample}
@@ -1124,35 +1229,50 @@ def build(username: str, conversation: Conversation) -> Lingo:
                     highest_score = score
                     best_match = item
                     
-        tool_definition = get_restaurant_details.__doc__
-        if tool_definition:
-            tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
-        else:
-            tool_definition = "Gets full information for a specific restaurant."
+        tool_definition = get_restaurant_details.__doc__ or "Gets full information for a specific restaurant."
+        tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
         
         if best_match and highest_score >= threshold:
-            # 2. Resumen de Éxito
             execution_summary = (
                 f"TOOL DEFINITION: [{tool_definition}] | "
                 f"ACTION TAKEN: Successfully retrieved full details for '{best_match.get('name')}'."
             )
             
+            match_report = {
+                "status": "Match Found",
+                "target": best_match.get('name'),
+                "confidence": round(highest_score, 2),
+                "original_query": restaurant_name
+            }
+            
+            # Directiva Genérica (Sin alucinaciones de campos)
+            system_directive = (
+                "SYSTEM INSTRUCTION: "
+                "The FULL JSON data is in 'results'. "
+                "Use the available fields in that object to answer the user's specific questions."
+            )
+            
             return {
-                "status": "success",
-                "restaurant": best_match,
-                "match_info": { ... },
+                "__SYSTEM_DIRECTIVE__": system_directive,
+                "report": match_report,    # Meta-data del hallazgo
+                "results": best_match,     # Payload real (JSON Completo)
                 "tool_execution_summary": execution_summary
             }
             
-        # 3. Resumen de Fallo
         execution_summary = (
             f"TOOL DEFINITION: [{tool_definition}] | "
             f"ACTION FAILED: Attempted to find details for '{restaurant_name}' but no match was found in the current list."
         )
         
+        fail_directive = (
+            "SYSTEM INSTRUCTION: No matching restaurant found in the current list. "
+            "Inform the user that the specific place is not in the search results."
+        )
+        
         return {
-            "error": f"No reliable match found for '{restaurant_name}' in the current set.",
-            "details": "The name could not be resolved semantically or structurally against the active list.",
+            "__SYSTEM_DIRECTIVE__": fail_directive,
+            "report": {"status": "No Match", "query": restaurant_name},
+            "results": {}, 
             "tool_execution_summary": execution_summary
         }
 
