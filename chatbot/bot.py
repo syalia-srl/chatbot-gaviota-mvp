@@ -3,7 +3,7 @@ from lingo.core import Conversation
 from .embed import Embedder
 from .config import load
 from difflib import SequenceMatcher
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from typing import List, Optional, Dict, Any
 from beaver import BeaverDB
 from enum import Enum
@@ -19,6 +19,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+STD_REPLY_INSTRUCTION = "Answer in the same language the user is currently using."
+
 
 active_ctx = contextvars.ContextVar("active_ctx")
 active_engine = contextvars.ContextVar("active_engine")
@@ -85,6 +88,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 count += 1
         return count
 
+
     class SearchLimit(BaseModel):
         """Structure to extract the exact quantity of results requested."""
 
@@ -109,11 +113,131 @@ def build(username: str, conversation: Conversation) -> Lingo:
         )
         search_query: str = Field(description="The extracted query string.")
 
+    async def get_user_intent(ctx: Context, engine: Engine) -> UserIntent:
+        """
+        Retrieves the UserIntent structure by analyzing the conversational dynamics.
+        It detects if the user changed the topic (RESET), is narrowing down (REFINE),
+        or focusing on a specific item (ISOLATED).
+        """
+        prompt = """
+        Analyze the CONVERSATIONAL DYNAMICS between the User's last message and the History.
+        
+        CLASSIFY THE INTERACTION MODE ('context_scope'):
+        
+        1. 'reset' (New Topic/Disjoint):
+        - The semantic subject changes completely (e.g., from "Hotels" to "Food", or "Beaches" to "Museums").
+        - Previous constraints are logically disjoint and should be discarded.
+        
+        2. 'refine' (Constraint Injection):
+        - The subject remains the same, but the user adds conditions (e.g., "cheaper", "closer", "with pool").
+        - The intent is to narrow down the current set.
+        
+        3. 'isolated' (Entity Focus):
+        - The user targets a SPECIFIC NAMED ENTITY (Proper Noun) for identification or inspection.
+        - The goal is depth (facts about one) rather than breadth (list of many).
+
+        Extract the core 'search_query' reflecting this new state and explain your 'reasoning'.
+        
+        Your response MUST BE IN ENGLISH
+        """
+        
+        # Directly returns the UserIntent instance defined in the class
+        return await engine.create(ctx, UserIntent, Message.system(prompt))
+
+
+    async def get_search_limit(ctx: Context, engine: Engine, default: int = 10) -> int:
+        """
+        Retrieves the SearchLimit structure to determine the magnitude of the request,
+        and returns the final processed integer (applying safety floors).
+        """
+        prompt = """
+        Analyze the User's request to identify the 'Search Universe Size' (quantity).
+        
+        SCENARIOS:
+        - Explicit: "Show me 5 options" -> quantity=5
+        - Implied Short: "Give me a couple" -> quantity=2
+        - Implied Long: "List all..." -> quantity=20 (Cap at a reasonable max)
+        - Conditional: "10 items, but only 2 red ones" -> quantity=10 (We need the initial pool size, not the result size).
+        
+        Return the integer representing the 'quantity' needed to answer.
+        """
+        
+        # Gets the structure defined in the SearchLimit class
+        limit_data = await engine.create(ctx, SearchLimit, Message.system(prompt))
+        
+        # Process the data from the structure
+        qty = limit_data.quantity if limit_data.quantity else default
+        
+        # Enforce a safety floor (minimum 5 items)
+        return max(qty, 5)
+
+    class ProcessStep(BaseModel):
+        tool_name: str = Field(..., description="The name of the tool to execute.")
+        instruction: str = Field(..., description="Natural language instruction for the tool.")
+
+    class ProcessingRecipe(BaseModel):
+        reasoning: str = Field(..., description="Explanation of the strategy.")
+        steps: List[ProcessStep] = Field(..., description="Execution sequence.")
+        
     class NameTranslation(BaseModel):
         """Structure to extract translate name"""
-
         translated_name: str
+        
+    async def design_data_processing_plan(
+        ctx: Context, 
+        engine: Engine, 
+        user_goal: str, 
+        available_data: List[Dict[str, Any]], 
+        tools_list: List[Any]
+    ) -> ProcessingRecipe:
+        """
+        Designs a plan creating a DYNAMIC STRICT MODEL to force the LLM 
+        to choose only from the provided tools via JSON Schema validation.
+        """
+        
+        tool_names = {t.name: t.name for t in tools_list}
+        DynamicToolEnum = Enum("DynamicToolEnum", tool_names)
 
+        StrictStep = create_model(
+            'StrictStep',
+            tool_name=(DynamicToolEnum, Field(..., description="The tool to execute.")),
+            instruction=(str, Field(..., description="Natural language instruction."))
+        )
+
+        StrictRecipe = create_model(
+            'StrictRecipe',
+            reasoning=(str, Field(..., description="Strategy explanation.")),
+            steps=(List[StrictStep], Field(..., description="Linear sequence."))
+        )
+
+        tools_desc = "\n".join([f"- {t.name}: {t.description}" for t in tools_list])
+        
+        plan_prompt = f"""
+        GOAL: "{user_goal}"
+        
+        CURRENT DATASET:
+        {str(available_data)}
+        
+        AVAILABLE TOOLS:
+        {tools_desc}
+        
+        TASK:
+        Design a data processing sequence using the AVAILABLE TOOLS.
+        """
+
+        strict_result = await engine.create(ctx, StrictRecipe, Message.system(plan_prompt))
+
+        return ProcessingRecipe(
+            reasoning=strict_result.reasoning,
+            steps=[
+                ProcessStep(
+                    tool_name=step.tool_name.value, 
+                    instruction=step.instruction
+                ) for step in strict_result.steps
+            ]
+        )
+    
+    
     @chatbot.skill
     async def city_explorer(ctx: Context, engine: Engine):
         """
@@ -327,267 +451,164 @@ def build(username: str, conversation: Conversation) -> Lingo:
         to food or drink consumption (Restaurants, Bars, Paladares).
         It owns queries regarding culinary offerings and dining environments.
         """
-        logger.info("Skill: GastroGuideSkill triggered")
+        logger.info("Skill: GastroGuideSkill (Global Planner + Linear Pipeline)")
 
-        search_tool = next(
-            (t for t in chatbot.tools if t.name == "search_restaurants_by_description"),
-            None,
-        )
-        details_tool = next(
-            (t for t in chatbot.tools if t.name == "get_restaurant_details"), None
-        )
-        filter_tool = next(
-            (t for t in chatbot.tools if t.name == "filter_restaurants"), None
-        )
+        # Variable para capturar el mensaje generado por el LLM
+        final_response_msg = None
+        # ==================================================================================
+        # 1. CONFIGURATION & TOOL SELECTION
+        # ==================================================================================
+        search_tool = next((t for t in chatbot.tools if t.name == "search_restaurants_by_description"), None)
+        filter_tool = next((t for t in chatbot.tools if t.name == "filter_restaurants"), None)
+        details_tool = next((t for t in chatbot.tools if t.name == "get_restaurant_details"), None)
 
-        if not search_tool:
-            logger.error("GastroGuide - Error: Search tool missing.")
-            return
-        
         mutators = [filter_tool]
         inspectors = [details_tool]
+        ref_tools = [t for t in (mutators + inspectors) if t is not None]
+        tool_map = {t.name: t for t in ref_tools}
 
-        msg = None
-
-        with ctx.fork():
-            intent_prompt = """
-            Analyze the USER'S LAST MESSAGE relative to the conversation history within the DINING domain.
-            
-            Determine the 'context_scope' based on the CONVERSATIONAL DYNAMICS:
-
-            1. 'reset' (New Search Vector): 
-               - The user explicitly DISCARDS the active topic or constraints.
-               - A fundamental shift in the primary search attributes (Location, Category, or "Vibe").
-            
-            2. 'refine' (Constraint Injection):
-               - The user MAINTAINS the active subject but applies narrowing conditions.
-               - Intent is to obtain a SUBSET of the current concept/list.
-            
-            3. 'isolated' (Entity Resolution):
-               - The user queries a SPECIFIC NAMED ENTITY (Proper Noun) rather than a category.
-               - Intent is "Fact Retrieval" about a single object.
-
-            Output the structured intent.
-            """
-            logger.info(f"Gastro - Getting intent")
-            intent = await engine.create(ctx, UserIntent, Message.system(intent_prompt))
-            logger.info(
-                f"Gastro - Intent: {intent.search_query} | Scope: {intent.context_scope}"
-            )
-
-            logger.info("Gastro - Primary Search Step")
-
-            search_limit = 10
-            limit_prompt = """
-            Analyze the user's request for quantities.
-            
-            TASK: Identify the 'Search Universe Size' (Total items to retrieve initially).
-            
-            SCENARIO 1: "Get 10 restaurants" -> quantity=10
-            SCENARIO 2: "Get 10 restaurants, and 2 of them with italian cuisine" -> quantity=10 (Because we need 10 candidates to find the 2 with italian cuisine).
-            SCENARIO 3: "Give me a couple of options" -> quantity=3 (Implied).
-            
-            RULE: If multiple numbers exist, choose the one referring to the TOTAL LIST SIZE or CANDIDATE POOL, not the subset constraints.
-            """
-            logger.info(f"Gastro - Getting quantity")
-            limit_data = await engine.create(
-                ctx, SearchLimit, Message.system(limit_prompt)
-            )
-            search_limit = limit_data.quantity if limit_data.quantity else 10
-            if search_limit < 5:
-                search_limit = 10
-            search_limit = search_limit*2
-            
-            logger.info(f"Gastro - Quantity: {search_limit}")
-            logger.info(f"Gastro - Searching candidates")
-            
-            search_output = await engine.invoke(
-                ctx,
-                search_tool,
-                description_query=intent.search_query,
-                limit=search_limit,
-            )
-            
-            if search_output.error:
-                ctx.append(Message.system(f"Search Error: {search_output.error}"))
-                working_data = [] # Fallback seguro
-                initial_data = []
-            else:
-                # 5. Inicialización de Doble Estado (Double State Init)
-                # Normalizamos la llave de salida (soporta 'restaurants' legacy o 'results' estándar)
-                raw_initial_data = search_output.result.get("results", search_output.result.get("restaurants", []))
-                
-                # DEEPCOPY CRÍTICO: Aseguramos que initial_data sea inmutable
-                initial_data = copy.deepcopy(raw_initial_data)
-                working_data = copy.deepcopy(raw_initial_data)
-                
-                ctx.append(
-                    Message.system(f"CANDIDATES IN JSON FORMAT  : {str(working_data)}")
+        # --- BLOQUE DE CONTROL PRINCIPAL ---
+        # Usamos try/finally para asegurar que el ctx.append ocurra SIEMPRE al final.
+        try:
+            if not search_tool:
+                final_response_msg = await engine.reply(
+                    ctx, 
+                    "Apologize and explain that a system configuration error prevents searching right now.",
+                    STD_REPLY_INSTRUCTION
                 )
-                
-            logger.info(f"Gastro - Memory Initialized: {len(working_data)} items")
-            
-            ref_tools = mutators + inspectors
-
-            tool_options = {clean_desc(t): t for t in ref_tools}
-            EXIT_OPTION = "REPLY: Have enough info to answer the user."
-            choice_options = list(tool_options.keys()) + [EXIT_OPTION]
-
-            step = 0
-            max_steps = 3
-            execution_trace = []
-            
-            token_ctx = active_ctx.set(ctx)
-            token_eng = active_engine.set(engine)
-            token_init = active_initial_results.set(initial_data) 
-            token_res = active_results.set(working_data)
-
-            try:
-                while step < max_steps:
-                    list_size = len(working_data)
-                    # data_state_note = f"DATA STATUS: You have {list_size} active candidates in context."
-                    data_state_note = ""
-
+            else:
+                # ==============================================================================
+                # 2. ISOLATED SESSION CONTEXT (Thinking Phase)
+                # ==============================================================================
+                with ctx.fork() as fork_ctx:
                     
-                    if step == 0:
-                        if intent.context_scope == ContextScope.RESET:
-                            data_state_note = "MEMORY STATUS: INVALID (New Topic). Current items are fresh from the new search."
-                        elif intent.context_scope == ContextScope.ISOLATED:
-                            data_state_note = "MEMORY STATUS: BYPASS (Specific Entity). User wants details of a specific place, not a list."
-                        else:
-                            data_state_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be refined."
-                    else:
-                        data_state_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
-
-                    # history_block = ""
-                    # if execution_trace:
-                    #     history_str = "\n".join([f"- {item}" for item in execution_trace])
-                    #     history_block = f"""
-                    #     --- EXECUTION HISTORY (Actions already completed) ---
-                    #     {history_str}
-                    #     -----------------------------------------------------
-                    #     CRITICAL INSTRUCTION: 
-                    #     1. Do NOT repeat an action listed above unless the parameters (entity/criteria) are different.
-                    #     2. If the HISTORY confirms the user's GOAL is already processed (e.g. "Action Taken: Processed 'pizza'"), DO NOT FILTER AGAIN.
-                    #     3. If the GOAL asks for multiple items (e.g. "A and B") and HISTORY only shows "A", proceed to get "B".
-                    #     """
+                    # --- PHASE A: INTELLIGENCE ---
+                    logger.info("GastroGuideSkill - Getting intent and ContextScope")
+                    intent = await get_user_intent(fork_ctx, engine)
+                    logger.info(f"GastroGuideSkill - Intent: {intent.search_query} and ContextScope¨: {intent.context_scope}")
+                    logger.info("GastroGuideSkill - Getting limit")
+                    limit_count = await get_search_limit(fork_ctx, engine)
+                    real_limit = limit_count * 2
+                    logger.info(f"GastroGuideSkill - Limit¨: {limit_count} using as limit: {real_limit}")
                     
-                    history_block = ""
-                    if execution_trace:
-                        history_str = "\n".join([f"- {item}" for item in execution_trace])
-                        history_block = f"""
-                        --- FULL EXECUTION HISTORY UNTIL NOW (Actions taken) ---
-                        {history_str}
-                        -----------------------------------------
-                        """
-                    
-                    # decision_prompt = f"""
-                    # GOAL: "{intent.search_query}"
-                    # {data_state_note}
-                    
-                    # {history_block}
-                    
-                    # AVAILABLE TOOLS:
-                    # {list(tool_options.keys())}
-                    
-                    # DECISION PROTOCOL:
-                    # Analyze the GOAL vs the EXECUTION HISTORY.
-                    # - If the goal requires information NOT present in history, select the tool.
-                    # - If the goal is met based on the history, select the Reply option.
-                    # """
-                    
-                    decision_prompt = f"""
-                    CURRENT GOAL: "{intent.search_query}"
-                    
-                    {history_block}
-                    
-                    AVAILABLE TOOLS TO DO ACTIONS:
-                    {list(tool_options.keys())}
-                    
-                    DECISION PROTOCOL (Checklist Logic):
-                    
-                    1. DECONSTRUCT THE GOAL:
-                       - Identify from the EXECUTION HISTORY if the GOAL is completed covered and, if not, what actions needs to be done 
-                    
-                    2. SCAN HISTORY FOR COVERAGE:
-                       - Check the entire history. Has *Action A* been done? Has *Action B* been done?
-                       - An action is "COVERED" if ANY line in the history shows it was successfully processed.
-                    
-                    3. DECIDE:
-                       - IF ALL actions needed for the Goal are COVERED in the History -> The task is complete. Select '{EXIT_OPTION}'.
-                       - IF an action is MISSING (not in History) -> Select the tool to address ONLY the missing item.
-                       - CRITICAL: DO NOT repeat an action that is already in the history.
-                    """
-                    
-                    logger.info(f"Gastro - Selecting tool")
-
-                    choice = await engine.choose(
-                        ctx, choice_options, Message.system(decision_prompt)
+                    # --- PHASE B: AXIOMATIC ACQUISITION (Search) ---
+                    logger.info(f"GastroGuideSkill - Searching for {real_limit} candidates")
+                    search_output = await engine.invoke(
+                        fork_ctx,
+                        search_tool,
+                        description_query=intent.search_query,
+                        limit=real_limit
                     )
 
-                    selected_tool = tool_options.get(choice)
-                    if selected_tool:
-                        logger.info(f"Gastro - Selected Tool: {selected_tool.name}")
-                        output = None
+                    candidates = []
+                    if search_output and not search_output.error:
+                        candidates = search_output.result.get("results", search_output.result.get("restaurants", []))
+                    
+                    if not candidates:
+                        # Generamos respuesta de 'no encontrado' dentro del fork
+                        final_response_msg = await engine.reply(
+                            fork_ctx,
+                            "Inform the user that you do not have any information matching their request.",
+                            STD_REPLY_INSTRUCTION
+                        )
+                        logger.info("GastroGuideSkill - No candidates and finishing skill")
+                    else:
+                        # --- PHASE C: STATE INITIALIZATION ---
+                        token_ctx = active_ctx.set(fork_ctx)
+                        token_eng = active_engine.set(engine)
+                        token_init = active_initial_results.set(copy.deepcopy(candidates))
+                        token_res = active_results.set(copy.deepcopy(candidates))
+                        
+                        fork_ctx.append(Message.system(f"RESTAURANTS KNOWLEDGE BASE: {candidates}"))
                         
                         try:
-                            # Esta es la línea mágica que te faltaba
-                            output = await engine.invoke(ctx, selected_tool)
-                        except Exception as e:
-                            logger.error(f"EXCEPTION in tool execution: {e}")
-                            output = None
-                        
-                        if output and not output.error:
+                            # --- PHASE D: PLANNING & EXECUTION ---
+                            logger.info("GastroGuideSkill - Getting plan")
+                            recipe = await design_data_processing_plan(
+                                fork_ctx, engine, intent.search_query, candidates, ref_tools
+                            )
+                            logger.info(f"GastroGuideSkill - Plan: {recipe}")
+                            for step in recipe.steps:
+                                selected_tool = tool_map.get(step.tool_name)
+                                logger.info(f"GastroGuideSkill - Using tool: {step.tool_name}")
+                                if selected_tool:
+                                    logger.info(f"GastroGuide - Executing step: {step.tool_name}")
+                    
+                                    # 1. Inferencia: El motor usa la instrucción para decidir parámetros.
+                                    # No añadimos la directiva al contexto antes para evitar inercia.
+                                    fork_ctx.append(Message.user(step.instruction))
+                                    fork_ctx.append(Message.system(f"STRICTLY FOLLOW THIS USER INTENTION: {Message.user(step.instruction)}"))
+                                    output = await engine.invoke(fork_ctx, selected_tool, instruction=step.instruction)
                                     
-                            # A. MEMORIA (Trace)
-                            summary = output.result.get("tool_execution_summary", f"Executed {selected_tool.name}")
-                            execution_trace.append(summary)
+                    
+                                    if output and not output.error:
+                                        # 2. Registro Semántico: Siempre añadimos el resumen de ejecución.
+                                        # Esto le dice al modelo qué ocurrió exactamente (ej: "Retrieved details for 'El Idilio'")
+                                        fork_ctx.append(Message.system(f"USER INTENT SUCCESSFULLY EXECUTED"))
+                                        if "tool_execution_summary" in output.result:
+                                            fork_ctx.append(Message.system(f"INTENT EXECUTED SUMMARY: {output.result['tool_execution_summary']}"))
+                                        
+                                        # 3. Lógica dinámica basada en el rol del Tool
+                                        
+                                        # Si es un INSPECTOR: El modelo necesita ver la data real para responder al usuario.
+                                        if selected_tool in inspectors:
+                                            if "results" in output.result:
+                                                fork_ctx.append(Message.system(f"ADDING TO KNOWLEDGE BASE: {output.result['results']}"))
+                                        
+                                        # Si es un MUTADOR: Actualizamos el estado interno (working_data) 
+                                        # pero no saturamos el contexto con la lista masiva.
+                                        if selected_tool in mutators:
+                                            new_data = output.result.get("results")
+                                            
+                                            working_data = new_data
+                                            active_results.set(working_data)
+                                            logger.info(f"GastroGuide - State mutated: {len(working_data)} items in working set.")
 
-                            # B. ESTADO (Mutation) - Solo si es Mutator
-                            # Verificación genérica contra la lista, no por nombre.
-                            if selected_tool in mutators:
-                                new_results = output.result.get("results")
-                                if new_results is not None:
-                                    working_data = new_results
-                                    active_results.set(working_data)
-                                    logger.info(f"Gastro - State Mutated. New size: {len(working_data)}")
+                                        # 4. Marcador de hito: Cerramos el ciclo de la instrucción actual.
+                                        # Esto ayuda a separar el procesamiento de un restaurante del siguiente.
+                                        fork_ctx.append(Message.system(f"INTENT EXECUTION STATUS: Finished intent execution"))
+                                    else:
+                                        error_info = output.error if output else "Communication Failure"
+                                        fork_ctx.append(Message.system(f"TASK_STATUS: Failed '{step.instruction}'. Error: {error_info}"))
 
-                            # C. VISUALIZACIÓN (Routing)
-                            
-                            # 1. Reporte (Navegación)
-                            if "report" in output.result:
-                                ctx.append(Message.system(f"NAVIGATION_REPORT: {str(output.result['report'])}"))
-                            
-                            # 2. Payload de Datos (Solo Inspectors)
-                            if selected_tool in inspectors:
-                                payload = output.result.get("results", output.result.get("restaurant"))
-                                if payload:
-                                    ctx.append(Message.system(f"DATA_INSPECTION_PAYLOAD: {str(payload)}"))
+                            # --- PHASE E: FINAL GENERATION ---
+                            # El LLM genera la respuesta basada en TODO lo acumulado en fork_ctx
+                            logger.info(f"GastroGuideSkill - Getting final response")
+                            for m in fork_ctx.messages:
+                                print(str(m))
+                            final_response_msg = await engine.reply(
+                                fork_ctx, 
+                                intent.search_query, 
+                                STD_REPLY_INSTRUCTION
+                            )
 
-                            # 3. Directivas de Sistema
-                            if "__SYSTEM_DIRECTIVE__" in output.result:
-                                ctx.append(Message.system(f"SYSTEM_NOTE: {output.result['__SYSTEM_DIRECTIVE__']}"))
+                        finally:
+                            active_ctx.reset(token_ctx)
+                            active_engine.reset(token_eng)
+                            active_initial_results.reset(token_init)
+                            active_results.reset(token_res)
 
-                        elif output:
-                            logger.error(f"Tool Error: {output.error}")
-                            ctx.append(Message.system(f"System Error: {output.error}"))
+        except Exception as e:
+            logger.error(f"GastroGuide Critical Failure: {e}")
+            # Respuesta de emergencia si algo rompe el flujo
+            final_response_msg = await engine.reply(
+                ctx, "An internal error occurred while processing the culinary data.", STD_REPLY_INSTRUCTION
+            )
+
+        finally:
+            # ==================================================================================
+            # 3. PUBLIC PUBLICATION (The "Moment of Truth")
+            # ==================================================================================
+            # Solo aquí, al insertar el mensaje en el contexto REAL (ctx), 
+            # es cuando el usuario recibe la respuesta y el bot adquiere memoria.
+            if not final_response_msg:
+                final_response_msg = await engine.reply(
+                    ctx, "An unexpected error occurred while processing the culinary data.", STD_REPLY_INSTRUCTION
+                )
+            ctx.append(final_response_msg)
+            logger.info("GastroGuide - Final message appended to main context.")
+            
                 
-                    else:
-                        logger.info(f"Gastro - Decision: Reply (Choice: '{choice}')")
-                        break
-
-                    step += 1
-                
-            finally:
-                # 7. Cierre del Scope (Limpieza Garantizada)
-                active_ctx.reset(token_ctx)
-                active_engine.reset(token_eng)
-                active_initial_results.reset(token_init)
-                active_results.reset(token_res)
-
-            msg = await engine.reply(ctx, intent.search_query)
-        
-        ctx.append(msg)
         
         
 
@@ -910,7 +931,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         user_criteria: str, **kwargs
     ) -> dict:
         """
-        Refines the restaurant using semantic mapping for categories like its location, type of cuisines, services offered, payment methods, budget, house specialties.
+        FILTER the restaurant using semantic mapping for exclusive this categories location, type of cuisines, services offered, payment methods, budget, house specialties. You CAN NOT FILTER for other categories except the mentioned before.
         """
         logger.info(f"Using tool  filter_restaurants | Criteria: {user_criteria}")
 
@@ -1190,6 +1211,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
             if h.get("name") and str(h.get("name")).strip()
         })
         
+        print(f"Database sample {database_sample}")
+        
         prompt = f"""
         USER INPUT: "{restaurant_name}"
         DATABASE NAME SAMPLES: {database_sample}
@@ -1202,8 +1225,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
         - Respond ONLY with the translated/mapped name string.
         - Example: If input is "Parque Central" and samples are in English, return "Central Park".
         """
-
-        res = await engine.create(ctx, NameTranslation, Message.system(prompt))
+        clean_ctx = Context(messages=[Message.system("You are a translation assistant specialized in Cuban restaurant names.")])
+        res = await engine.create(clean_ctx, NameTranslation, Message.system(prompt))
         translated_name = res.translated_name.strip()
         logger.info(f"Name Translation: '{restaurant_name}' -> '{translated_name}'")
 
