@@ -22,11 +22,21 @@ logger = logging.getLogger(__name__)
 
 STD_REPLY_INSTRUCTION = "Answer in the same language the user is currently using."
 
+ANTI_HALLUCINATION_GUARD = (
+    "CRITICAL TRUTH PROTOCOL: "
+    "1. Your knowledge is STRICTLY LIMITED to the provided 'BASE DATASET' and 'TOOLS_EXECUTION_LOG'. "
+    "2. If the specific information (address, price, menu item) is NOT present in the provided JSON data, "
+    "   you MUST explicitly state: 'I do not have that information in my current records'. "
+    "3. DO NOT HALLUCINATE. It is forbidden to invent phone numbers, locations, or details not visible in the context. "
+    "4. If the tools failed or returned empty lists, admit that you could not find the place."
+)
+
 
 active_ctx = contextvars.ContextVar("active_ctx")
 active_engine = contextvars.ContextVar("active_engine")
 active_results = contextvars.ContextVar("active_results")
 active_initial_results = contextvars.ContextVar("active_initial_results")
+
 
 def build(username: str, conversation: Conversation) -> Lingo:
     config = load()
@@ -43,51 +53,54 @@ def build(username: str, conversation: Conversation) -> Lingo:
         # We pass the conversation wrapper here
         conversation=conversation,
     )
-    
+
     def is_fuzzy_match(actual_val: str, target_val: str, threshold=0.8) -> bool:
         """Str fuzzy match"""
         if not actual_val or not target_val:
             return False
-            
+
         s_actual = str(actual_val).lower().strip()
         s_target = str(target_val).lower().strip()
-            
+
         if s_actual == s_target:
             return True
-            
+
         if s_target in s_actual:
             return True
-                
+
         similarity = SequenceMatcher(None, s_actual, s_target).ratio()
         return similarity >= threshold
 
     def check_any_match(item_val: Any, target_list: List[str]) -> bool:
-        if not target_list: return False 
-        if not item_val: return False
+        if not target_list:
+            return False
+        if not item_val:
+            return False
         values = item_val if isinstance(item_val, list) else [item_val]
         return any(is_fuzzy_match(str(v), t) for v in values for t in target_list)
 
     def check_text_match(full_text: str, keywords: List[str]) -> bool:
-        if not keywords: return False
+        if not keywords:
+            return False
         return any(kw.lower() in full_text for kw in keywords)
-    
+
     def clean_desc(t):
         return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
-    
+
     def count_matches(item_val: Any, target_list: List[str]) -> int:
-        if not target_list or not item_val: return 0
-        
+        if not target_list or not item_val:
+            return 0
+
         # Normalizamos a lista siempre
         values = item_val if isinstance(item_val, list) else [item_val]
         count = 0
-        
+
         # Iteramos targets para ver si están presentes en los valores del item
         for target in target_list:
             # Usamos la función is_fuzzy_match que ya tienes definida en el scope
             if any(is_fuzzy_match(str(v), target) for v in values):
                 count += 1
         return count
-
 
     class SearchLimit(BaseModel):
         """Structure to extract the exact quantity of results requested."""
@@ -140,12 +153,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
         
         Your response MUST BE IN ENGLISH
         """
-        
+
         # Directly returns the UserIntent instance defined in the class
         return await engine.create(ctx, UserIntent, Message.system(prompt))
 
-
-    async def get_search_limit(ctx: Context, engine: Engine, default: int = 10) -> int:
+    async def get_search_limit(ctx: Context, engine: Engine, default: int = 5) -> int:
         """
         Retrieves the SearchLimit structure to determine the magnitude of the request,
         and returns the final processed integer (applying safety floors).
@@ -154,90 +166,135 @@ def build(username: str, conversation: Conversation) -> Lingo:
         Analyze the User's request to identify the 'Search Universe Size' (quantity).
         
         SCENARIOS:
-        - Explicit: "Show me 5 options" -> quantity=5
+        - Explicit: "Show me 3 options" -> quantity=3
         - Implied Short: "Give me a couple" -> quantity=2
-        - Implied Long: "List all..." -> quantity=20 (Cap at a reasonable max)
-        - Conditional: "10 items, but only 2 red ones" -> quantity=10 (We need the initial pool size, not the result size).
+        - Conditional: "4 items, but only 1 red one" -> quantity=4 (We need the initial pool size).
         
-        Return the integer representing the 'quantity' needed to answer.
+        CRITICAL RULES:
+        1. If the user DOES NOT specify or imply a quantity (e.g., "Find restaurants" or "Show me hotels"), you MUST set quantity to null (None).
+        2. Do NOT invent numbers. If no number is requested, return None.
         """
-        
+
         # Gets the structure defined in the SearchLimit class
         limit_data = await engine.create(ctx, SearchLimit, Message.system(prompt))
-        
+
         # Process the data from the structure
-        qty = limit_data.quantity if limit_data.quantity else default
-        
+        # Si devuelve None, usamos default (5).
+        # Si alucina copiando un ejemplo (2, 3 o 4), usamos ese número.
+        qty = limit_data.quantity if limit_data.quantity is not None else default
+
         # Enforce a safety floor (minimum 5 items)
+        # Esto asegura que siempre tengamos un mínimo de contexto útil.
         return max(qty, 5)
 
+    class ScopeType(str, Enum):
+        ISOLATED = "isolated"
+        CHAINED = "chained"
+
     class ProcessStep(BaseModel):
-        tool_name: str = Field(..., description="The name of the tool to execute.")
-        instruction: str = Field(..., description="Natural language instruction for the tool.")
+        tool_name: str = Field(
+            ..., description="The exact name of the tool to execute."
+        )
+        instruction: str = Field(
+            ..., description="The specific natural language instruction for the tool."
+        )
+        scope: ScopeType = Field(
+            default=ScopeType.ISOLATED,
+            description="Defines the memory isolation for this step. 'isolated' prevents data pollution between distinct entities.",
+        )
 
     class ProcessingRecipe(BaseModel):
-        reasoning: str = Field(..., description="Explanation of the strategy.")
-        steps: List[ProcessStep] = Field(..., description="Execution sequence.")
-        
+        reasoning: str = Field(..., description="Strategic explanation of the flow.")
+        steps: List[ProcessStep] = Field(
+            ..., description="The sequence of steps to execute."
+        )
+
     class NameTranslation(BaseModel):
         """Structure to extract translate name"""
+
         translated_name: str
-        
+
     async def design_data_processing_plan(
-        ctx: Context, 
-        engine: Engine, 
-        user_goal: str, 
-        available_data: List[Dict[str, Any]], 
-        tools_list: List[Any]
+        ctx: Context,
+        engine: Engine,
+        user_goal: str,
+        available_data: List[Dict[str, Any]],
+        tools_list: List[Any],
     ) -> ProcessingRecipe:
         """
-        Designs a plan creating a DYNAMIC STRICT MODEL to force the LLM 
-        to choose only from the provided tools via JSON Schema validation.
+        Designs a data processing plan based purely on architectural rules of cardinality and scope,
+        without hardcoded knowledge of specific tool names.
         """
-        
+
         tool_names = {t.name: t.name for t in tools_list}
         DynamicToolEnum = Enum("DynamicToolEnum", tool_names)
 
         StrictStep = create_model(
-            'StrictStep',
-            tool_name=(DynamicToolEnum, Field(..., description="The tool to execute.")),
-            instruction=(str, Field(..., description="Natural language instruction."))
+            "StrictStep",
+            tool_name=(
+                DynamicToolEnum,
+                Field(..., description="The tool to select from the available list."),
+            ),
+            instruction=(
+                str,
+                Field(..., description="Precise instruction provided to the tool."),
+            ),
+            scope=(
+                ScopeType,
+                Field(..., description="Memory scope: 'isolated' or 'chained'."),
+            ),
         )
 
         StrictRecipe = create_model(
-            'StrictRecipe',
+            "StrictRecipe",
             reasoning=(str, Field(..., description="Strategy explanation.")),
-            steps=(List[StrictStep], Field(..., description="Linear sequence."))
+            steps=(List[StrictStep], Field(..., description="Linear sequence.")),
         )
 
         tools_desc = "\n".join([f"- {t.name}: {t.description}" for t in tools_list])
-        
+
         plan_prompt = f"""
         GOAL: "{user_goal}"
         
-        CURRENT DATASET:
-        {str(available_data)}
+        DATA CONTEXT SUMMARY:
+        (Analyze the provided data structure to understand the entities involved)
+        {str(available_data)[:2000]} ... [Truncated]
         
         AVAILABLE TOOLS:
         {tools_desc}
         
+        ARCHITECTURAL RULES (CRITICAL):
+        
+        1. CARDINALITY & ATOMICITY:
+           - If a tool is designed to retrieve deep information about an entity, it typically requires a SPECIFIC TARGET (Name/ID).
+           - FORBIDDEN: Instructions referring to "all items", "the list", or generic groups.
+           - REQUIRED: If multiple entities need processing, generate SEPARATE steps for each one (e.g., Step 1 for Entity A, Step 2 for Entity B).
+        
+        2. MEMORY SCOPE STRATEGY:
+           - SCOPE 'isolated': Use this for steps that target a specific entity or a new search. 
+             This ensures the tool starts with a clean slate, preventing confusion with data from previous steps.
+           - SCOPE 'chained': Use this ONLY if the explicit goal is to refine/filter the output of the IMMEDIATELY PREVIOUS step.
+        
         TASK:
-        Design a data processing sequence using the AVAILABLE TOOLS.
+        Design the execution sequence to achieve the GOAL using the AVAILABLE TOOLS.
         """
 
-        strict_result = await engine.create(ctx, StrictRecipe, Message.system(plan_prompt))
+        strict_result = await engine.create(
+            ctx, StrictRecipe, Message.system(plan_prompt)
+        )
 
         return ProcessingRecipe(
             reasoning=strict_result.reasoning,
             steps=[
                 ProcessStep(
-                    tool_name=step.tool_name.value, 
-                    instruction=step.instruction
-                ) for step in strict_result.steps
-            ]
+                    tool_name=step.tool_name.value,
+                    instruction=step.instruction,
+                    scope=step.scope,
+                )
+                for step in strict_result.steps
+            ],
         )
-    
-    
+
     @chatbot.skill
     async def city_explorer(ctx: Context, engine: Engine):
         """
@@ -407,23 +464,23 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 selected_tool = tool_options.get(choice)
                 if selected_tool:
                     logger.info("Concierge - Tool selected:" + str(selected_tool.name))
-                    
+
                     token_ctx = active_ctx.set(ctx)
                     token_eng = active_engine.set(engine)
                     token_res = active_results.set(current_hotel_list)
-                    
+
                     try:
                         output = await engine.invoke(ctx, selected_tool)
-                        
+
                     except Exception as e:
                         logger.error(f"EXCEPTION in tool execution: {e}")
-                        output = None 
-                        
+                        output = None
+
                     finally:
                         active_ctx.reset(token_ctx)
                         active_engine.reset(token_eng)
                         active_results.reset(token_res)
-                        
+
                     if not output.error:
                         current_hotel_list = output.result.get("results", [])
                         ctx.append(
@@ -453,164 +510,258 @@ def build(username: str, conversation: Conversation) -> Lingo:
         """
         logger.info("Skill: GastroGuideSkill (Global Planner + Linear Pipeline)")
 
-        # Variable para capturar el mensaje generado por el LLM
         final_response_msg = None
-        # ==================================================================================
-        # 1. CONFIGURATION & TOOL SELECTION
-        # ==================================================================================
-        search_tool = next((t for t in chatbot.tools if t.name == "search_restaurants_by_description"), None)
-        filter_tool = next((t for t in chatbot.tools if t.name == "filter_restaurants"), None)
-        details_tool = next((t for t in chatbot.tools if t.name == "get_restaurant_details"), None)
 
-        mutators = [filter_tool]
-        inspectors = [details_tool]
-        ref_tools = [t for t in (mutators + inspectors) if t is not None]
+        # 1. TOOL SETUP
+        search_tool = next(
+            (t for t in chatbot.tools if t.name == "search_restaurants_by_description"),
+            None,
+        )
+        filter_tool = next(
+            (t for t in chatbot.tools if t.name == "filter_restaurants"), None
+        )
+        details_tool = next(
+            (t for t in chatbot.tools if t.name == "get_restaurant_details"), None
+        )
+
+        # --- CORRECCIÓN: DEFINICIÓN EXPLÍCITA DE ROLES ---
+        inspectors = [t for t in [details_tool] if t is not None]
+        mutators = [t for t in [filter_tool] if t is not None]
+
+        # Construimos ref_tools uniendo las listas
+        ref_tools = inspectors + mutators
         tool_map = {t.name: t for t in ref_tools}
 
-        # --- BLOQUE DE CONTROL PRINCIPAL ---
-        # Usamos try/finally para asegurar que el ctx.append ocurra SIEMPRE al final.
         try:
             if not search_tool:
                 final_response_msg = await engine.reply(
-                    ctx, 
-                    "Apologize and explain that a system configuration error prevents searching right now.",
-                    STD_REPLY_INSTRUCTION
+                    ctx,
+                    "System Error: Search configuration missing.",
+                    STD_REPLY_INSTRUCTION,
                 )
             else:
-                # ==============================================================================
                 # 2. ISOLATED SESSION CONTEXT (Thinking Phase)
-                # ==============================================================================
                 with ctx.fork() as fork_ctx:
-                    
+
                     # --- PHASE A: INTELLIGENCE ---
-                    logger.info("GastroGuideSkill - Getting intent and ContextScope")
+                    logger.info("GastroGuideSkill - Getting intent")
                     intent = await get_user_intent(fork_ctx, engine)
-                    logger.info(f"GastroGuideSkill - Intent: {intent.search_query} and ContextScope¨: {intent.context_scope}")
+                    logger.info(f"GastroGuideSkill - intent {str(intent)}")
+
                     logger.info("GastroGuideSkill - Getting limit")
                     limit_count = await get_search_limit(fork_ctx, engine)
                     real_limit = limit_count * 2
-                    logger.info(f"GastroGuideSkill - Limit¨: {limit_count} using as limit: {real_limit}")
-                    
-                    # --- PHASE B: AXIOMATIC ACQUISITION (Search) ---
-                    logger.info(f"GastroGuideSkill - Searching for {real_limit} candidates")
+                    logger.info(f"GastroGuideSkill - limit {real_limit}")
+
+                    # --- PHASE B: SEARCH ---
+                    logger.info(
+                        f"GastroGuideSkill - Searching for {real_limit} candidates"
+                    )
                     search_output = await engine.invoke(
                         fork_ctx,
                         search_tool,
                         description_query=intent.search_query,
-                        limit=real_limit
+                        limit=real_limit,
                     )
 
                     candidates = []
                     if search_output and not search_output.error:
-                        candidates = search_output.result.get("results", search_output.result.get("restaurants", []))
-                    
+                        candidates = search_output.result.get(
+                            "results", search_output.result.get("restaurants", [])
+                        )
+
                     if not candidates:
-                        # Generamos respuesta de 'no encontrado' dentro del fork
                         final_response_msg = await engine.reply(
                             fork_ctx,
-                            "Inform the user that you do not have any information matching their request.",
-                            STD_REPLY_INSTRUCTION
+                            "Inform the user that no matching results were found.",
+                            STD_REPLY_INSTRUCTION,
                         )
-                        logger.info("GastroGuideSkill - No candidates and finishing skill")
                     else:
                         # --- PHASE C: STATE INITIALIZATION ---
-                        token_ctx = active_ctx.set(fork_ctx)
                         token_eng = active_engine.set(engine)
-                        token_init = active_initial_results.set(copy.deepcopy(candidates))
+                        token_init = active_initial_results.set(
+                            copy.deepcopy(candidates)
+                        )
                         token_res = active_results.set(copy.deepcopy(candidates))
-                        
-                        fork_ctx.append(Message.system(f"RESTAURANTS KNOWLEDGE BASE: {candidates}"))
-                        
+
+                        # Memory Directive & Data Injection
+                        memory_directive = ""
+                        if intent.context_scope == ContextScope.RESET:
+                            memory_directive = "MEMORY STATUS: RESET. User changed topic. Ignore previous conversation constraints."
+                        elif intent.context_scope == ContextScope.ISOLATED:
+                            memory_directive = "MEMORY STATUS: ISOLATED. User targets a specific entity. Ignore previous list filtering constraints."
+                        else:
+                            memory_directive = "MEMORY STATUS: VALID. User is refining previous context."
+
+                        fork_ctx.append(Message.system(memory_directive))
+                        fork_ctx.append(
+                            Message.system(
+                                f"BASE DATASET (Source of Truth): {candidates}"
+                            )
+                        )
+
                         try:
                             # --- PHASE D: PLANNING & EXECUTION ---
-                            logger.info("GastroGuideSkill - Getting plan")
+                            logger.info("GastroGuideSkill - Requesting Plan")
                             recipe = await design_data_processing_plan(
-                                fork_ctx, engine, intent.search_query, candidates, ref_tools
+                                fork_ctx,
+                                engine,
+                                intent.search_query,
+                                candidates,
+                                ref_tools,
                             )
-                            logger.info(f"GastroGuideSkill - Plan: {recipe}")
-                            for step in recipe.steps:
-                                selected_tool = tool_map.get(step.tool_name)
-                                logger.info(f"GastroGuideSkill - Using tool: {step.tool_name}")
-                                if selected_tool:
-                                    logger.info(f"GastroGuide - Executing step: {step.tool_name}")
-                    
-                                    # 1. Inferencia: El motor usa la instrucción para decidir parámetros.
-                                    # No añadimos la directiva al contexto antes para evitar inercia.
-                                    fork_ctx.append(Message.user(step.instruction))
-                                    fork_ctx.append(Message.system(f"STRICTLY FOLLOW THIS USER INTENTION: {Message.user(step.instruction)}"))
-                                    output = await engine.invoke(fork_ctx, selected_tool, instruction=step.instruction)
-                                    
-                    
-                                    if output and not output.error:
-                                        # 2. Registro Semántico: Siempre añadimos el resumen de ejecución.
-                                        # Esto le dice al modelo qué ocurrió exactamente (ej: "Retrieved details for 'El Idilio'")
-                                        fork_ctx.append(Message.system(f"USER INTENT SUCCESSFULLY EXECUTED"))
-                                        if "tool_execution_summary" in output.result:
-                                            fork_ctx.append(Message.system(f"INTENT EXECUTED SUMMARY: {output.result['tool_execution_summary']}"))
-                                        
-                                        # 3. Lógica dinámica basada en el rol del Tool
-                                        
-                                        # Si es un INSPECTOR: El modelo necesita ver la data real para responder al usuario.
-                                        if selected_tool in inspectors:
-                                            if "results" in output.result:
-                                                fork_ctx.append(Message.system(f"ADDING TO KNOWLEDGE BASE: {output.result['results']}"))
-                                        
-                                        # Si es un MUTADOR: Actualizamos el estado interno (working_data) 
-                                        # pero no saturamos el contexto con la lista masiva.
-                                        if selected_tool in mutators:
-                                            new_data = output.result.get("results")
-                                            
-                                            working_data = new_data
-                                            active_results.set(working_data)
-                                            logger.info(f"GastroGuide - State mutated: {len(working_data)} items in working set.")
+                            logger.info(f"GastroGuideSkill - Strategy: {str(recipe)}")
 
-                                        # 4. Marcador de hito: Cerramos el ciclo de la instrucción actual.
-                                        # Esto ayuda a separar el procesamiento de un restaurante del siguiente.
-                                        fork_ctx.append(Message.system(f"INTENT EXECUTION STATUS: Finished intent execution"))
-                                    else:
-                                        error_info = output.error if output else "Communication Failure"
-                                        fork_ctx.append(Message.system(f"TASK_STATUS: Failed '{step.instruction}'. Error: {error_info}"))
+                            # Pipeline State
+                            last_step_payload = (
+                                None  # Data passed to next step (Chaining)
+                            )
+
+                            # --- UNIFIED HISTORY (SINCRONIZADA) ---
+                            process_history = []
+
+                            for i, step in enumerate(recipe.steps):
+                                logger.info(
+                                    f"Executing Step {i+1}: {step.tool_name} | Scope: {step.scope}"
+                                )
+
+                                # --- CORRECCIÓN: RESET DE VARIABLE DE ENCADENAMIENTO ---
+                                # Capturamos el input para este paso y limpiamos la variable global del loop
+                                # para asegurar que si este paso falla o es un mutator, el siguiente paso empiece limpio.
+                                current_chained_input = last_step_payload
+                                last_step_payload = None
+
+                                selected_tool = tool_map.get(step.tool_name)
+                                if not selected_tool:
+                                    logger.error(f"Tool {step.tool_name} not found.")
+                                    process_history.append(
+                                        {
+                                            "step_index": i + 1,
+                                            "action": step.instruction,
+                                            "status": "SKIPPED",
+                                            "error": "Tool configuration error",
+                                        }
+                                    )
+                                    continue
+
+                                # 1. EPHEMERAL CONTEXT CREATION
+                                step_ctx = fork_ctx.clone()
+
+                                # 2. SCOPE INJECTION
+                                if (
+                                    step.scope == ScopeType.CHAINED
+                                    and current_chained_input
+                                ):
+                                    # Usamos la variable local capturada al inicio del ciclo
+                                    step_ctx.append(
+                                        Message.system(
+                                            f"PREVIOUS STEP OUTPUT: {current_chained_input}"
+                                        )
+                                    )
+
+                                # 3. INSTRUCTION
+                                step_ctx.append(Message.user(step.instruction))
+
+                                # 4. INVOKE (Token Isolation)
+                                token_step = active_ctx.set(step_ctx)
+                                try:
+                                    output = await engine.invoke(
+                                        step_ctx,
+                                        selected_tool,
+                                        instruction=step.instruction,
+                                    )
+                                finally:
+                                    active_ctx.reset(token_step)
+
+                                step_record = {
+                                    "step_index": i + 1,
+                                    "tool": step.tool_name,
+                                    "instruction": step.instruction,
+                                }
+
+                                if output and not output.error:
+                                    res_data = output.result
+                                    payload = res_data.get("results", res_data)
+                                    report = res_data.get(
+                                        "report", res_data.get("ranking_report")
+                                    )
+                                    summary = res_data.get(
+                                        "tool_execution_summary",
+                                        f"Executed {step.instruction}",
+                                    )
+
+                                    step_record["status"] = "SUCCESS"
+                                    step_record["execution_narrative"] = summary
+
+                                    # --- CORRECCIÓN: USO DE LISTAS EXPLÍCITAS ---
+                                    is_inspector = selected_tool in inspectors
+                                    is_mutator = selected_tool in mutators
+
+                                    if is_inspector:
+                                        step_record["result_data"] = payload
+                                        # Solo los inspectors propagan datos al siguiente paso
+                                        last_step_payload = payload
+
+                                    if report:
+                                        step_record["technical_report"] = report
+
+                                    # Mutator Logic: Actualiza active_results pero no propaga texto al chat
+                                    if (
+                                        is_mutator
+                                        and payload
+                                        and isinstance(payload, list)
+                                    ):
+                                        active_results.set(payload)
+
+                                else:
+                                    step_record["status"] = "FAILED"
+                                    step_record["error"] = (
+                                        output.error
+                                        if output
+                                        else "Unknown Execution Error"
+                                    )
+                                    # Al fallar, last_step_payload se mantiene en None gracias al reset inicial
+
+                                process_history.append(step_record)
 
                             # --- PHASE E: FINAL GENERATION ---
-                            # El LLM genera la respuesta basada en TODO lo acumulado en fork_ctx
-                            logger.info(f"GastroGuideSkill - Getting final response")
-                            for m in fork_ctx.messages:
-                                print(str(m))
+                            response_ctx = fork_ctx.clone()
+
+                            if process_history:
+                                response_ctx.append(
+                                    Message.system(
+                                        f"TOOLS_EXECUTION_LOG: {process_history}"
+                                    )
+                                )
+
                             final_response_msg = await engine.reply(
-                                fork_ctx, 
-                                intent.search_query, 
-                                STD_REPLY_INSTRUCTION
+                                response_ctx,
+                                intent.search_query,
+                                ANTI_HALLUCINATION_GUARD,
+                                STD_REPLY_INSTRUCTION,
                             )
+                            # --- TUS PRINTS DE DEBUG ORIGINALES ---
+                            print("Final Context")
+                            for m in response_ctx.messages:
+                                print(m)
 
                         finally:
-                            active_ctx.reset(token_ctx)
                             active_engine.reset(token_eng)
                             active_initial_results.reset(token_init)
                             active_results.reset(token_res)
 
         except Exception as e:
             logger.error(f"GastroGuide Critical Failure: {e}")
-            # Respuesta de emergencia si algo rompe el flujo
             final_response_msg = await engine.reply(
-                ctx, "An internal error occurred while processing the culinary data.", STD_REPLY_INSTRUCTION
+                ctx, "An internal error occurred.", STD_REPLY_INSTRUCTION
             )
 
         finally:
-            # ==================================================================================
-            # 3. PUBLIC PUBLICATION (The "Moment of Truth")
-            # ==================================================================================
-            # Solo aquí, al insertar el mensaje en el contexto REAL (ctx), 
-            # es cuando el usuario recibe la respuesta y el bot adquiere memoria.
             if not final_response_msg:
                 final_response_msg = await engine.reply(
-                    ctx, "An unexpected error occurred while processing the culinary data.", STD_REPLY_INSTRUCTION
+                    ctx, "An unexpected error occurred.", STD_REPLY_INSTRUCTION
                 )
             ctx.append(final_response_msg)
-            logger.info("GastroGuide - Final message appended to main context.")
-            
-                
-        
-        
 
     @chatbot.skill
     async def location_manager(ctx: Context, engine: Engine):
@@ -631,7 +782,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         AUTHORITY: Handles all subjects that are not related to hotels or similar,
         also no related to restaurants, bars or similar.
-        
+
         EXCLUSION: Never response with information related to restaurants, bars, hotels, hostals or related type of
         """
 
@@ -651,9 +802,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         return docs
 
     @chatbot.tool
-    async def filter_hotels(
-        user_criteria: str, **kwargs
-    ) -> dict:
+    async def filter_hotels(user_criteria: str, **kwargs) -> dict:
         """
         Filter hotels based on a natural language description, craving, or vibe.
         """
@@ -663,14 +812,16 @@ def build(username: str, conversation: Conversation) -> Lingo:
             ctx = active_ctx.get()
             current_results = active_results.get()
         except LookupError:
-            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
+            logger.error(
+                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
+            )
             return {"error": "Internal Error: Context missing"}
         if not current_results:
             logger.warning("Aborting because current_results is empty.")
             return {
                 "results": [],
                 "total": 0,
-                "msg": "No hotels to filter. The previous search returned 0 results."
+                "msg": "No hotels to filter. The previous search returned 0 results.",
             }
 
         if not current_results:
@@ -714,59 +865,55 @@ def build(username: str, conversation: Conversation) -> Lingo:
         Map the USER REQUEST to the EXACT strings found in the AVAILABLE METADATA.
         If terms are in different languages, match them by semantic meaning.
         """
-        
+
         params = await engine.create(ctx, FilterParams, Message.system(mapping_prompt))
         refined = current_results
-        
 
         if params.stars is not None:
             refined = [h for h in refined if h.get("stars") == params.stars]
 
         if params.province:
             refined = [
-                h for h in refined 
-                if is_fuzzy_match(h.get("province"), params.province)
+                h for h in refined if is_fuzzy_match(h.get("province"), params.province)
             ]
 
         if params.municipality:
             refined = [
-                h for h in refined 
+                h
+                for h in refined
                 if is_fuzzy_match(h.get("municipality"), params.municipality)
             ]
 
         if params.location:
             refined = [
-                h for h in refined 
-                if is_fuzzy_match(h.get("location"), params.location)
+                h for h in refined if is_fuzzy_match(h.get("location"), params.location)
             ]
 
         if params.company:
             refined = [
-                h for h in refined 
-                if is_fuzzy_match(h.get("company"), params.company)
+                h for h in refined if is_fuzzy_match(h.get("company"), params.company)
             ]
 
         if params.matched_features:
             req_features_norm = [f.lower().strip() for f in params.matched_features]
             scored_candidates = []
-            
 
             for item in refined:
                 item_features = [f.lower() for f in item.get("features", [])]
                 score = 0
-                
+
                 for req in req_features_norm:
                     if any(req in feat or feat in req for feat in item_features):
                         score += 1
-                
+
                 if score > 0:
                     item["_match_score"] = score
                     scored_candidates.append(item)
-            
+
             scored_candidates.sort(key=lambda x: x["_match_score"], reverse=True)
-            
+
             refined = scored_candidates
-            
+
         if not refined:
             logger.warning("Features filter removed all candidates.")
 
@@ -809,9 +956,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         }
 
     @chatbot.tool
-    async def get_hotel_details(
-        hotel_name: str, **kwargs
-    ) -> dict:
+    async def get_hotel_details(hotel_name: str, **kwargs) -> dict:
         """
         Gets the full information for a specific hotel by name.
         """
@@ -823,7 +968,9 @@ def build(username: str, conversation: Conversation) -> Lingo:
             engine = active_engine.get()
             current_results = active_results.get()
         except LookupError:
-            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
+            logger.error(
+                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
+            )
             return {"error": "Internal Error: Context missing"}
         if not current_results:
             logger.warning("Aborting because current_results is empty.")
@@ -891,7 +1038,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
     @chatbot.tool
     async def search_restaurants_by_description(
-        description_query: str, municipality: str = None, limit: int = 15
+        description_query: str, municipality: str = None, limit: int = 10
     ) -> dict:
         """
         Finds restaurants based on a natural language description, craving, or vibe.
@@ -927,9 +1074,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         }
 
     @chatbot.tool
-    async def filter_restaurants(
-        user_criteria: str, **kwargs
-    ) -> dict:
+    async def filter_restaurants(user_criteria: str, **kwargs) -> dict:
         """
         FILTER the restaurant using semantic mapping for exclusive this categories location, type of cuisines, services offered, payment methods, budget, house specialties. You CAN NOT FILTER for other categories except the mentioned before.
         """
@@ -940,25 +1085,22 @@ def build(username: str, conversation: Conversation) -> Lingo:
             engine = active_engine.get()
             current_results = active_results.get()
         except LookupError:
-            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
-            return {"error": "Internal Error: Context missing"}
-        if not current_results:
-            logger.warning("Aborting because current_results is empty.")
-            empty_summary = (
-                "ACTION ABORTED: Attempted filter but the data is empty. "
-                "No context to search in."
+            logger.error(
+                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
             )
-            
             return {
-                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: No data. You cannot filter. Ask user to Search first.",
-                "report": {"status": "Error", "msg": "No data available"}, 
-                "results": {},
-                "tool_execution_summary": empty_summary
+                "results": [],
+                "report": [],
+                "tool_execution_summary": "ACTION FAILED: Internal context error.",
             }
 
         if not current_results:
-            return {"results": [], "warning": "List is empty."}
-
+            logger.warning("Aborting because current_results is empty.")
+            return {
+                "results": [],
+                "report": [],
+                "tool_execution_summary": "ACTION ABORTED: No data to filter.",
+            }
 
         def get_unique_from_list(field):
             values = set()
@@ -977,31 +1119,59 @@ def build(username: str, conversation: Conversation) -> Lingo:
             "services": get_unique_from_list("type_of_service"),
             "payments": get_unique_from_list("payment_options"),
         }
+
         class RestaurantFilters(BaseModel):
             # LOCATION
-            target_provinces: List[str] = Field(default=[], description="Provinces to INCLUDE.")
-            excluded_provinces: List[str] = Field(default=[], description="Provinces to EXCLUDE.")
-            
-            target_municipalities: List[str] = Field(default=[], description="Municipalities to INCLUDE.")
-            excluded_municipalities: List[str] = Field(default=[], description="Municipalities to EXCLUDE.")
+            target_provinces: List[str] = Field(
+                default=[], description="Provinces to INCLUDE."
+            )
+            excluded_provinces: List[str] = Field(
+                default=[], description="Provinces to EXCLUDE."
+            )
+
+            target_municipalities: List[str] = Field(
+                default=[], description="Municipalities to INCLUDE."
+            )
+            excluded_municipalities: List[str] = Field(
+                default=[], description="Municipalities to EXCLUDE."
+            )
 
             # CUISINE
-            target_cuisines: List[str] = Field(default=[], description="Cuisines to INCLUDE.")
-            excluded_cuisines: List[str] = Field(default=[], description="Cuisines to EXCLUDE.")
+            target_cuisines: List[str] = Field(
+                default=[], description="Cuisines to INCLUDE."
+            )
+            excluded_cuisines: List[str] = Field(
+                default=[], description="Cuisines to EXCLUDE."
+            )
 
             # SERVICES & PAYMENTS
-            target_services: List[str] = Field(default=[], description="Services to INCLUDE.")
-            excluded_services: List[str] = Field(default=[], description="Services to EXCLUDE.")
-            
-            target_payments: List[str] = Field(default=[], description="Payment methods to INCLUDE.")
-            excluded_payments: List[str] = Field(default=[], description="Payment methods to EXCLUDE.")
+            target_services: List[str] = Field(
+                default=[], description="Services to INCLUDE."
+            )
+            excluded_services: List[str] = Field(
+                default=[], description="Services to EXCLUDE."
+            )
+
+            target_payments: List[str] = Field(
+                default=[], description="Payment methods to INCLUDE."
+            )
+            excluded_payments: List[str] = Field(
+                default=[], description="Payment methods to EXCLUDE."
+            )
 
             # KEYWORDS (Catch-all)
-            specialty_keywords: List[str] = Field(default=[], description="Positive keywords for dishes/vibes not in lists.")
-            excluded_keywords: List[str] = Field(default=[], description="Negative keywords to avoid.")
+            specialty_keywords: List[str] = Field(
+                default=[],
+                description="eywords for SPECIFIC FOOD OR DRINK ITEMS (e.g., 'lobster', 'pizza'). DO NOT include adjectives like 'romantic', 'cozy' or 'cheap', etc.",
+            )
+            excluded_keywords: List[str] = Field(
+                default=[], description="Keywords for specific INGREDIENTS or ITEMS to avoid (e.g., 'peanuts', 'pork', 'smoking'). DO NOT use for abstract qualities like 'romantic', 'cozy' or 'cheap', etc."
+            )
 
             # BUDGET
-            max_budget_usd: Optional[float] = Field(None, description="Max price limit per person.")
+            max_budget_usd: Optional[float] = Field(
+                None, description="Max price limit per person."
+            )
 
         filter_prompt = f"""
         ROLE: Expert semantic extraction for restaurant filtering.
@@ -1027,16 +1197,23 @@ def build(username: str, conversation: Conversation) -> Lingo:
            - Query: "Italian food" -> target_cuisines=['Italian'].
            - Query: "No Pizza" -> excluded_cuisines=['Italian'] (or keyword 'pizza').
 
-        3. **KEYWORDS**:
-           - Use 'specialty_keywords' for specific dishes like "lobster", "pizza", "fried rice" if they don't perfectly match a Cuisine category.
+        3. **KEYWORDS (TANGIBLE NOUNS ONLY)**:
+           - Use 'specialty_keywords' EXCLUSIVELY for physical food/drink items (e.g. 'lobster', 'daiquiri', 'tacos').
+           - STRICTLY EXCLUDE atmospheric, emotional, or quality adjectives (e.g., 'romantic', 'best', 'cheap', 'cosy').
+           - REASONING: This step is strictly for INVENTORY validation (Checking if a specific item exists on the menu).
+
+        4. **EXCLUSIONS (INGREDIENTS ONLY)**:
+           - Use 'excluded_keywords' ONLY for physical restrictions (Allergens, specific ingredients).
+           - Examples: 'peanuts', 'shellfish', 'pork', 'alcohol'.
+           - FORBIDDEN: Do not use abstract adjectives (e.g., 'expensive', 'bad', 'noisy', 'slow').
            
-        4. **BUDGET**: 
+        5. **BUDGET**: 
            - Extract max price only if a number or "cheap"/"expensive" is mentioned.
-        
+           
         OUTPUT: JSON only.
         """
         logger.info(f"filter_restaurants - Getting filters")
-        
+
         filters = await engine.create(
             ctx, RestaurantFilters, Message.system(filter_prompt)
         )
@@ -1044,35 +1221,61 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         # Helper para parsear precios
         def parse_price_range(price_str):
-            if not price_str: return (0, float('inf'))
+            if not price_str:
+                return (0, float("inf"))
             nums = re.findall(r"[\d\.]+", str(price_str))
-            if not nums: return (0, float('inf'))
-            vals = [float(n) for n in nums if n.replace('.', '', 1).isdigit()]
-            if not vals: return (0, float('inf'))
+            if not nums:
+                return (0, float("inf"))
+            vals = [float(n) for n in nums if n.replace(".", "", 1).isdigit()]
+            if not vals:
+                return (0, float("inf"))
             return (min(vals), max(vals)) if len(vals) > 1 else (0, vals[0])
-                
-        logger.info(f"filter_restaurants - Filtering results of {len(current_results)} candidates")
+
+        logger.info(
+            f"filter_restaurants - Filtering results of {len(current_results)} candidates"
+        )
         refined_full_data = []  # Para el sistema (código)
-        ranking_report = []     # Para el razonamiento (LLM)        
-        user_max_budget = float(filters.max_budget_usd) if filters.max_budget_usd is not None else None
+        ranking_report = []  # Para el razonamiento (LLM)
+        user_max_budget = (
+            float(filters.max_budget_usd)
+            if filters.max_budget_usd is not None
+            else None
+        )
 
         for r in current_results:
             r_prov = r.get("province")
             r_muni = r.get("municipality")
             r_cuisine = r.get("cuisine", [])
             r_services = r.get("type_of_service", [])
-            # r_payment = r.get("payment_options", [])
-            # r_addr = r.get("place_details", {}).get("address", "No Address")
-            full_text = (str(r.get("name", "")) + " " + str(r.get("house_specialty", "")) + " " + str(r.get("description", ""))).lower()
+            full_text = (
+                str(r.get("name", ""))
+                + " "
+                + str(r.get("house_specialty", ""))
+                + " "
+                + str(r.get("description", ""))
+            ).lower()
 
             # A. Exclusiones
-            if filters.excluded_provinces and check_any_match(r_prov, filters.excluded_provinces): continue
-            if filters.excluded_municipalities and check_any_match(r_muni, filters.excluded_municipalities): continue
-            if filters.excluded_cuisines and (check_any_match(r_cuisine, filters.excluded_cuisines) or check_text_match(full_text, filters.excluded_cuisines)): continue
-            if filters.excluded_keywords and check_text_match(full_text, filters.excluded_keywords): continue
+            if filters.excluded_provinces and check_any_match(
+                r_prov, filters.excluded_provinces
+            ):
+                continue
+            if filters.excluded_municipalities and check_any_match(
+                r_muni, filters.excluded_municipalities
+            ):
+                continue
+            if filters.excluded_cuisines and (
+                check_any_match(r_cuisine, filters.excluded_cuisines)
+                or check_text_match(full_text, filters.excluded_cuisines)
+            ):
+                continue
+            if filters.excluded_keywords and check_text_match(
+                full_text, filters.excluded_keywords
+            ):
+                continue
 
             # B. Matches (Evidencia)
-            match_log = {} 
+            match_log = {}
             score_general = 0
 
             def add_evidence(category, specific_match):
@@ -1083,38 +1286,49 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 match_log[category].append(specific_match)
 
             for t in filters.target_cuisines:
-                if is_fuzzy_match(t, r_cuisine) or (t.lower() in full_text): add_evidence("Cuisine_Match", t)
-            
+                if is_fuzzy_match(t, r_cuisine) or (t.lower() in full_text):
+                    add_evidence("Cuisine_Match", t)
+
             for t in filters.target_services:
-                if is_fuzzy_match(t, r_services) or (t.lower() in full_text): add_evidence("Service_Match", t)
-                
+                if is_fuzzy_match(t, r_services) or (t.lower() in full_text):
+                    add_evidence("Service_Match", t)
+
             for k in filters.specialty_keywords:
-                if k.lower() in full_text: add_evidence("Keyword_Found", k)
+                if k.lower() in full_text:
+                    add_evidence("Keyword_Found", k)
 
             if user_max_budget is not None:
                 min_p, max_p = parse_price_range(r.get("average_price", ""))
-                if min_p > user_max_budget: continue 
-                elif max_p <= user_max_budget: add_evidence("Budget", "Within Limit")
+                if min_p > user_max_budget:
+                    continue
+                elif max_p <= user_max_budget:
+                    add_evidence("Budget", "Within Limit")
 
             # C. Construcción Dual
-            has_filters = (filters.target_cuisines or filters.target_services or filters.specialty_keywords or filters.target_payments or user_max_budget)
-            
+            has_filters = (
+                filters.target_cuisines
+                or filters.target_services
+                or filters.specialty_keywords
+                or filters.target_payments
+                or user_max_budget
+            )
+
             if not has_filters or score_general > 0:
                 # 1. Objeto Completo (Enriquecido)
-                full_item = r.copy() # Copia segura
+                full_item = r.copy()  # Copia segura
                 full_item["_RANK_SCORE"] = score_general
                 full_item["_MATCH_LOG"] = match_log
                 refined_full_data.append(full_item)
-                
+
                 # 2. Objeto Reporte (Minificado para razonamiento)
                 ref_item = {
                     "name": r.get("name"),
                     "RANK_SCORE": score_general,
-                    "MATCH_LOG": match_log, 
-                    "ID_LOC": { # Contexto mínimo de ubicación
+                    "MATCH_LOG": match_log,
+                    "ID_LOC": {  # Contexto mínimo de ubicación
                         "mun": r_muni,
-                        "prov": r_prov
-                    }
+                        "prov": r_prov,
+                    },
                 }
                 ranking_report.append(ref_item)
 
@@ -1123,45 +1337,37 @@ def build(username: str, conversation: Conversation) -> Lingo:
         ranking_report.sort(key=lambda x: x.get("RANK_SCORE", 0), reverse=True)
 
         # --- 4. RESUMEN Y RETORNO ---
-        top_score = ranking_report[0].get("RANK_SCORE", 0) if ranking_report else 0
-        validation_msg = ""
-        if top_score > 1:
-            validation_msg = "Top items satisfy MULTIPLE criteria."
-        elif top_score == 1:
-            validation_msg = "Top items satisfy at least one criterion."
-        else:
-            validation_msg = "No specific matches found."
-
-        # Directiva Híbrida
-        system_directive = (
-            "SYSTEM INSTRUCTION: "
-            "1. 'ranking_report' contains the LOGIC (Score/Why). Use it to decide WHICH items to recommend. "
-            "2. 'results' contains the FULL DATA (Descriptions/Address). Use it to describe the items. "
-            f"3. {validation_msg} Prioritize items with high Scores."
-        )
+        # top_score = ranking_report[0].get("RANK_SCORE", 0) if ranking_report else 0
+        # validation_msg = ""
+        # if top_score > 1:
+        #     validation_msg = "Top items satisfy MULTIPLE criteria."
+        # elif top_score == 1:
+        #     validation_msg = "Top items satisfy at least one criterion."
+        # else:
+        #     validation_msg = "No specific matches found."
 
         tool_definition = filter_restaurants.__doc__ or "Refines results."
-        tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
+        tool_definition = (
+            tool_definition.strip().replace("\n", " ").replace("    ", " ")
+        )
 
         execution_summary = (
             f"TOOL DEFINITION: [{tool_definition}] | "
             f"ACTION TAKEN: Applied filtering based on user criteria: '{user_criteria}'. "
-            # f"List reduced to {len(refined_full_data)} items. "
+            f"Active Filters: {filters.dict(exclude_none=True, exclude_defaults=True)}. "
+            f"Kept {len(refined_full_data)} items."
         )
-        
+
         logger.info(f"filter_restaurants - Summary: {execution_summary}")
 
         return {
-            "__SYSTEM_DIRECTIVE__": system_directive,
-            "ranking_report": ranking_report, # Para que el LLM entienda la lógica rápido
-            "results": refined_full_data,     # Para que el Bot y Tools tengan la data completa
-            "tool_execution_summary": execution_summary
+            "report": ranking_report,  # Para que el LLM entienda la lógica rápido
+            "results": refined_full_data,  # Para que el Bot y Tools tengan la data completa
+            "tool_execution_summary": execution_summary,
         }
 
     @chatbot.tool
-    async def get_restaurant_details(
-        restaurant_name: str, **kwargs
-    ) -> dict:
+    async def get_restaurant_details(restaurant_name: str, **kwargs) -> dict:
         """
         Gets the full information for a specific restaurant by name.
         """
@@ -1172,47 +1378,32 @@ def build(username: str, conversation: Conversation) -> Lingo:
             engine = active_engine.get()
             current_results = active_results.get()
         except LookupError:
-            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
-            
-            # Resumen: El LLM lee esto en su historial. Debe sonar a "acción fallida".
-            error_summary = "ACTION FAILED: The tool could not access the current list of restaurants due to an internal error."
-            
-            return {
-                # Directiva: Lenguaje natural puro. El "Sistema" le dice al "Agente" que falló.
-                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: The search process failed. The information is currently inaccessible. Apologize to the user.",
-                
-                # Reporte: Estado abstracto
-                "report": {"status": "Failure", "reason": "Data Inaccessible"}, 
-                
-                # Datos: Vacíos
-                "results": {},
-                
-                # Trace
-                "tool_execution_summary": error_summary
-            }
-            
-        if not current_results:
-            logger.warning("get_restaurant_details - Aborting: List is empty.")
-            
-            empty_summary = (
-                "ACTION ABORTED: Attempted to get details but the active list is empty. "
-                "No context to search in."
+            logger.error(
+                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
             )
-            
             return {
-                "__SYSTEM_DIRECTIVE__": "SYSTEM ALERT: No data. You cannot Inspect details. Ask user to Search first.",
-                "report": {"status": "Error", "msg": "No data available"}, 
                 "results": {},
-                "tool_execution_summary": empty_summary
+                "report": {"status": "Failure", "reason": "Data Inaccessible"},
+                "tool_execution_summary": "ACTION FAILED: Data context missing.",
             }
 
-        database_sample = sorted({
-            h.get("name") for h in current_results 
-            if h.get("name") and str(h.get("name")).strip()
-        })
-        
+        if not current_results:
+            return {
+                "results": {},
+                "report": {"status": "Failure", "reason": "Empty List"},
+                "tool_execution_summary": "ACTION ABORTED: No active list to search in.",
+            }
+
+        database_sample = sorted(
+            {
+                h.get("name")
+                for h in current_results
+                if h.get("name") and str(h.get("name")).strip()
+            }
+        )
+
         print(f"Database sample {database_sample}")
-        
+
         prompt = f"""
         USER INPUT: "{restaurant_name}"
         DATABASE NAME SAMPLES: {database_sample}
@@ -1225,7 +1416,13 @@ def build(username: str, conversation: Conversation) -> Lingo:
         - Respond ONLY with the translated/mapped name string.
         - Example: If input is "Parque Central" and samples are in English, return "Central Park".
         """
-        clean_ctx = Context(messages=[Message.system("You are a translation assistant specialized in Cuban restaurant names.")])
+        clean_ctx = Context(
+            messages=[
+                Message.system(
+                    "You are a translation assistant specialized in Cuban restaurant names."
+                )
+            ]
+        )
         res = await engine.create(clean_ctx, NameTranslation, Message.system(prompt))
         translated_name = res.translated_name.strip()
         logger.info(f"Name Translation: '{restaurant_name}' -> '{translated_name}'")
@@ -1251,52 +1448,45 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 if score > highest_score:
                     highest_score = score
                     best_match = item
-                    
-        tool_definition = get_restaurant_details.__doc__ or "Gets full information for a specific restaurant."
-        tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
-        
+
+        tool_definition = (
+            get_restaurant_details.__doc__
+            or "Gets full information for a specific restaurant."
+        )
+        tool_definition = (
+            tool_definition.strip().replace("\n", " ").replace("    ", " ")
+        )
+
         if best_match and highest_score >= threshold:
             execution_summary = (
                 f"TOOL DEFINITION: [{tool_definition}] | "
                 f"ACTION TAKEN: Successfully retrieved full details for '{best_match.get('name')}'."
             )
-            
+
             match_report = {
                 "status": "Match Found",
-                "target": best_match.get('name'),
+                "target": best_match.get("name"),
                 "confidence": round(highest_score, 2),
-                "original_query": restaurant_name
+                "original_query": restaurant_name,
             }
-            
+
             # Directiva Genérica (Sin alucinaciones de campos)
-            system_directive = (
-                "SYSTEM INSTRUCTION: "
-                "The FULL JSON data is in 'results'. "
-                "Use the available fields in that object to answer the user's specific questions."
-            )
-            
+
             return {
-                "__SYSTEM_DIRECTIVE__": system_directive,
-                "report": match_report,    # Meta-data del hallazgo
-                "results": best_match,     # Payload real (JSON Completo)
-                "tool_execution_summary": execution_summary
+                "report": match_report,  # Meta-data del hallazgo
+                "results": best_match,  # Payload real (JSON Completo)
+                "tool_execution_summary": execution_summary,
             }
-            
+
         execution_summary = (
             f"TOOL DEFINITION: [{tool_definition}] | "
             f"ACTION FAILED: Attempted to find details for '{restaurant_name}' but no match was found in the current list."
         )
-        
-        fail_directive = (
-            "SYSTEM INSTRUCTION: No matching restaurant found in the current list. "
-            "Inform the user that the specific place is not in the search results."
-        )
-        
+
         return {
-            "__SYSTEM_DIRECTIVE__": fail_directive,
             "report": {"status": "No Match", "query": restaurant_name},
-            "results": {}, 
-            "tool_execution_summary": execution_summary
+            "results": {},
+            "tool_execution_summary": execution_summary,
         }
 
     @chatbot.tool
