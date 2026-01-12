@@ -323,181 +323,187 @@ def build(username: str, conversation: Conversation) -> Lingo:
         intended for staying or sleeping (Hotels, Resorts, Villas, etc.).
         It owns all queries regarding their specific services, features, and availability.
         """
+        logger.info("Skill: Concierge (Global Planner + Linear Pipeline)")
 
-        logger.info("Skill: Concierge")
+        final_response_msg = None
+        
+        # 1. TOOL SETUP
+        search_tool = next((t for t in chatbot.tools if t.name == "search_hotels_by_description"), None)
+        filter_tool = next((t for t in chatbot.tools if t.name == "filter_hotels"), None)
+        details_tool = next((t for t in chatbot.tools if t.name == "get_hotel_details"), None)
 
-        search_tool = next(
-            (t for t in chatbot.tools if t.name == "search_hotels_by_description"), None
-        )
-        details_tool = next(
-            (t for t in chatbot.tools if t.name == "get_hotel_details"), None
-        )
-        filter_tool = next(
-            (t for t in chatbot.tools if t.name == "filter_hotels"), None
-        )
+        # --- DEFINICIÓN EXPLÍCITA DE ROLES ---
+        inspectors = [t for t in [details_tool] if t is not None]
+        mutators = [t for t in [filter_tool] if t is not None]
+        
+        ref_tools = inspectors + mutators
+        tool_map = {t.name: t for t in ref_tools}
 
-        if not search_tool:
-            return
-
-        final_response = None
-
-        with ctx.fork():
-            intent_prompt = """
-            Analyze the USER'S LAST MESSAGE relative to the CONVERSATION HISTORY.
-            
-            Determine the 'context_scope' (How previous constraints apply now):
-
-            1. 'reset': 
-               - The user changes the Subject or Domain entirely.
-               - Previous constraints (filters, locations, entities, etc) are now irrelevant constraints.
-            
-            2. 'refine':
-               - The user is narrowing down, filtering, or asking a follow-up about the *current list* of results.
-               - Previous constraints MUST BE KEPT.
-            
-            3. 'isolated':
-               - The user asks about a SPECIFIC ENTITY or FACT that stands alone.
-               - Previous constraints (e.g., "cheap", "with pool") should be IGNORED for this specific query to avoid false negatives.
-               - Example: Context is "Cheap Campisms". User asks: "Tell me about Hotel Nacional". 
-                 (Result: 'isolated', because Nacional is not a campism, but user specifically wants it).
-
-            Output the decision.
-            """
-
-            intent = await engine.create(ctx, UserIntent, Message.system(intent_prompt))
-
-            logger.info(f"Concierge - Intent Logic: {intent.reasoning}")
-            logger.info(f"Concierge - New Query: {intent.search_query}")
-            logger.info(f"Concierge - Context scope: {intent.context_scope}")
-
-            current_hotel_list = []
-            search_limit = 10
-            limit_prompt = """
-            Analyze the user's request for quantities.
-            
-            TASK: Identify the 'Search Universe Size' (Total items to retrieve initially).
-            
-            SCENARIO 1: "Get 10 hotels" -> quantity=10
-            SCENARIO 2: "Get 10 hotels, and 2 of them with spa" -> quantity=10 (Because we need 10 candidates to find the 2 with spa).
-            SCENARIO 3: "Give me a couple of options" -> quantity=3 (Implied).
-            
-            RULE: If multiple numbers exist, choose the one referring to the TOTAL LIST SIZE or CANDIDATE POOL, not the subset constraints.
-            """
-            limit_data = await engine.create(
-                ctx, SearchLimit, Message.system(limit_prompt)
-            )
-            search_limit = limit_data.quantity if limit_data.quantity else 10
-            if search_limit < 5:
-                search_limit = 5
-            logger.info("Concierge - quantity:" + str(search_limit))
-
-            logger.info("Concierge -  primary search")
-            tool_output = await engine.invoke(
-                ctx,
-                search_tool,
-                description_query=intent.search_query,
-                limit=search_limit,
-            )
-
-            if tool_output.error:
-                ctx.append(Message.system(f"Error: {tool_output.error}"))
+        try:
+            if not search_tool:
+                final_response_msg = await engine.reply(
+                    ctx, "System Error: Hotel search configuration missing.", STD_REPLY_INSTRUCTION
+                )
             else:
-                current_hotel_list = tool_output.result.get("hotels", [])
-                ctx.append(
-                    Message.system(f"DATABASE_RESULTS: {str(tool_output.result)}")
-                )
-
-            ref_tools = [t for t in [details_tool, filter_tool] if t]
-
-            def clean_desc(t):
-                return f"{t.name}: {t.description.strip().replace(chr(10), ' ')}"
-
-            tool_options = {clean_desc(t): t for t in ref_tools}
-
-            EXIT_OPTION = "REPLY: Have enough info to answer the user."
-            choice_options = list(tool_options.keys()) + [EXIT_OPTION]
-
-            step = 0
-            max_step = 3
-            while step < max_step:
-
-                logger.info("Concierge - Setting context scope")
-
-                list_size = len(current_hotel_list)
-
-                data_validity_note = ""
-
-                if step == 0:
-                    if intent.context_scope == ContextScope.RESET:
-                        data_validity_note = "MEMORY STATUS: INVALID. The items currently in memory belong to a previous topic. Do not filter them."
-
-                    elif intent.context_scope == ContextScope.ISOLATED:
-                        data_validity_note = "MEMORY STATUS: BYPASS. The user wants a specific entity. Ignore previous list constraints."
-
-                    else:
-                        data_validity_note = f"MEMORY STATUS: VALID. You have {list_size} candidates ready to be processed."
-                else:
-                    data_validity_note = f"MEMORY STATUS: FRESH. Latest tool output contains {list_size} items."
-
-                logger.info("Concierge - Selecting tool")
-
-                decision_logic = f"""
-                CURRENT GOAL: "{intent.search_query}"
-                {data_validity_note}
-
-                AVAILABLE TOOLS:
-                {list(tool_options.keys())}
-                
-                INSTRUCTION: 
-                Analyze the GOAL and the MEMORY STATUS. 
-                Select the tool that best achieves the goal given the current data availability.
-                """
-
-                choice = await engine.choose(
-                    ctx, choice_options, Message.system(decision_logic)
-                )
-
-                if choice == EXIT_OPTION:
-                    logger.info("Concierge - No tool selected")
-                    break
-
-                selected_tool = tool_options.get(choice)
-                if selected_tool:
-                    logger.info("Concierge - Tool selected:" + str(selected_tool.name))
-
-                    token_ctx = active_ctx.set(ctx)
-                    token_eng = active_engine.set(engine)
-                    token_res = active_results.set(current_hotel_list)
-
-                    try:
-                        output = await engine.invoke(ctx, selected_tool)
-
-                    except Exception as e:
-                        logger.error(f"EXCEPTION in tool execution: {e}")
-                        output = None
-
-                    finally:
-                        active_ctx.reset(token_ctx)
-                        active_engine.reset(token_eng)
-                        active_results.reset(token_res)
-
-                    if not output.error:
-                        current_hotel_list = output.result.get("results", [])
-                        ctx.append(
-                            Message.system(
-                                f"DETAILED_INFO_{selected_tool.name}: {str(output.result)}"
-                            )
+                # 2. ISOLATED SESSION CONTEXT
+                with ctx.fork() as fork_ctx:
+                    
+                    # --- PHASE A: INTELLIGENCE ---
+                    logger.info("Concierge - Getting intent")
+                    intent = await get_user_intent(fork_ctx, engine)
+                    
+                    logger.info("Concierge - Getting limit")
+                    limit_count = await get_search_limit(fork_ctx, engine)
+                    real_limit = limit_count * 2
+                    
+                    # --- PHASE B: SEARCH ---
+                    logger.info(f"Concierge - Searching for {real_limit} candidates")
+                    search_output = await engine.invoke(
+                        fork_ctx,
+                        search_tool,
+                        description_query=intent.search_query,
+                        limit=real_limit
+                    )
+                    
+                    candidates = []
+                    if search_output and not search_output.error:
+                        # Adaptamos la clave de retorno según el tool de hoteles
+                        candidates = search_output.result.get("hotels", search_output.result.get("results", []))
+                    
+                    if not candidates:
+                        final_response_msg = await engine.reply(
+                            fork_ctx, "Inform the user that no matching hotels were found.", STD_REPLY_INSTRUCTION
                         )
                     else:
-                        logger.error(f"Concierge - Tool Exec Error: {output.error}")
-                        ctx.append(Message.system(f"System Error: {output.error}"))
+                        # --- PHASE C: STATE INITIALIZATION ---
+                        token_eng = active_engine.set(engine)
+                        token_init = active_initial_results.set(copy.deepcopy(candidates))
+                        token_res = active_results.set(copy.deepcopy(candidates))
 
-                step += 1
+                        # Memory Directive & Data Injection
+                        memory_directive = ""
+                        if intent.context_scope == ContextScope.RESET:
+                            memory_directive = "MEMORY STATUS: RESET. User changed topic. Ignore previous conversation constraints."
+                        elif intent.context_scope == ContextScope.ISOLATED:
+                            memory_directive = "MEMORY STATUS: ISOLATED. User targets a specific entity. Ignore previous list filtering constraints."
+                        else:
+                            memory_directive = "MEMORY STATUS: VALID. User is refining previous context."
 
-            final_response = await engine.reply(ctx)
+                        fork_ctx.append(Message.system(memory_directive))
+                        fork_ctx.append(Message.system(f"BASE DATASET (Source of Truth): {candidates}"))
 
-        if final_response:
-            ctx.append(final_response)
+                        try:
+                            # --- PHASE D: PLANNING & EXECUTION ---
+                            logger.info("Concierge - Requesting Plan")
+                            recipe = await design_data_processing_plan(
+                                fork_ctx, engine, intent.search_query, candidates, ref_tools
+                            )
+                            logger.info(f"Concierge - Strategy: {str(recipe)}")
+
+                            last_step_payload = None
+                            
+                            process_history = []
+
+                            for i, step in enumerate(recipe.steps):
+                                logger.info(f"Executing Step {i+1}: {step.tool_name} | Scope: {step.scope}")
+                                
+                                # --- RESET DE VARIABLE DE ENCADENAMIENTO ---
+                                current_chained_input = last_step_payload
+                                last_step_payload = None
+                                
+                                selected_tool = tool_map.get(step.tool_name)
+                                if not selected_tool:
+                                    logger.error(f"Tool {step.tool_name} not found.")
+                                    continue
+
+                                # 1. EPHEMERAL CONTEXT CREATION
+                                step_ctx = fork_ctx.clone()
+
+                                # 2. SCOPE INJECTION
+                                if step.scope == ScopeType.CHAINED and current_chained_input:
+                                    step_ctx.append(Message.system(f"PREVIOUS STEP OUTPUT: {current_chained_input}"))
+                                
+                                # 3. INSTRUCTION
+                                step_ctx.append(Message.user(step.instruction))
+
+                                # 4. INVOKE (Token Isolation)
+                                token_step = active_ctx.set(step_ctx)
+                                try:
+                                    output = await engine.invoke(step_ctx, selected_tool, instruction=step.instruction)
+                                finally:
+                                    active_ctx.reset(token_step)
+
+                                step_record = {
+                                    "step_index": i + 1,
+                                    "tool": step.tool_name,
+                                    "instruction": step.instruction,
+                                }
+                                
+                                if output and not output.error:
+                                    res_data = output.result
+                                    
+                                    # Extracción de Payload (Compatible con estructura vieja y nueva)
+                                    # Priorizamos "results", luego "hotel" (usado en tools viejos), luego el raw data
+                                    payload = res_data.get("results", res_data.get("hotel", res_data))
+                                    
+                                    # Extracción de Reporte (Compatible con estructura vieja y nueva)
+                                    report = res_data.get("report", res_data.get("match_info"))
+                                    
+                                    summary = res_data.get("tool_execution_summary", f"Executed {step.instruction}")
+                                    
+                                    step_record["status"] = "SUCCESS"
+                                    step_record["execution_narrative"] = summary
+
+                                    # --- LÓGICA DE ROLES ---
+                                    is_inspector = selected_tool in inspectors
+                                    is_mutator = selected_tool in mutators
+
+                                    if is_inspector:
+                                        step_record["result_data"] = payload
+                                        last_step_payload = payload
+                                    
+                                    if report:
+                                        step_record["technical_report"] = report
+
+                                    # Mutator Logic: Actualiza active_results si es una lista
+                                    if is_mutator and payload and isinstance(payload, list):
+                                        active_results.set(payload)
+                                else:
+                                    step_record["status"] = "FAILED"
+                                    step_record["error"] = output.error if output else "Unknown Execution Error"
+                                
+                                process_history.append(step_record)
+
+                            # --- PHASE E: FINAL GENERATION ---
+                            response_ctx = fork_ctx.clone()
+
+                            if process_history:
+                                response_ctx.append(Message.system(f"TOOLS_EXECUTION_LOG: {process_history}"))
+
+                            combined_instruction = STD_REPLY_INSTRUCTION + " " + ANTI_HALLUCINATION_GUARD
+
+                            final_response_msg = await engine.reply(
+                                response_ctx, intent.search_query, combined_instruction
+                            )
+                            
+                            # Debug prints
+                            print("Final Context Concierge")
+                            for m in response_ctx.messages:
+                                print(m)
+                        
+                        finally:
+                            active_engine.reset(token_eng)
+                            active_initial_results.reset(token_init)
+                            active_results.reset(token_res)
+
+        except Exception as e:
+            logger.error(f"Concierge Critical Failure: {e}")
+            final_response_msg = await engine.reply(ctx, "An internal error occurred.", STD_REPLY_INSTRUCTION)
+        
+        finally:
+            if not final_response_msg:
+                final_response_msg = await engine.reply(ctx, "An unexpected error occurred.", STD_REPLY_INSTRUCTION)
+            ctx.append(final_response_msg)
 
     @chatbot.skill
     async def gastro_guide(ctx: Context, engine: Engine):
@@ -802,41 +808,44 @@ def build(username: str, conversation: Conversation) -> Lingo:
         return docs
 
     @chatbot.tool
-    async def filter_hotels(user_criteria: str, **kwargs) -> dict:
+    async def filter_hotels(
+        user_criteria: str, **kwargs
+    ) -> dict:
         """
-        Filter hotels based on a natural language description, craving, or vibe.
+        Filter the list of hotels based on the user's natural language criteria.
+        It can filter by star rating (stars), specific location (province, municipality),
+        hotel chain (company), or specific features (pool, wifi, all-inclusive, etc.).
         """
         logger.info("Using tool: filter_hotels")
 
         try:
             ctx = active_ctx.get()
+            engine = active_engine.get()
             current_results = active_results.get()
         except LookupError:
-            logger.error(
-                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
-            )
-            return {"error": "Internal Error: Context missing"}
-        if not current_results:
-            logger.warning("Aborting because current_results is empty.")
+            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
             return {
                 "results": [],
-                "total": 0,
-                "msg": "No hotels to filter. The previous search returned 0 results.",
+                "report": {"status": "Failure", "reason": "Context Missing"},
+                "tool_execution_summary": "ACTION FAILED: Internal context error."
             }
 
         if not current_results:
-            return {"results": [], "total": 0}
+            return {
+                "results": [],
+                "report": {"status": "Zero Input", "total_before": 0, "total_after": 0},
+                "tool_execution_summary": "ACTION ABORTED: No hotels to filter (Input list empty)."
+            }
 
+        # --- 1. PREPARACIÓN DE METADATA ---
         def get_unique_set(key: str) -> List[Any]:
-            return sorted(
-                list({h.get(key) for h in current_results if h.get(key) is not None})
-            )
+            return sorted(list({h.get(key) for h in current_results if h.get(key) is not None}))
 
         all_unique_features = set()
         for h in current_results:
-            features = h.get("features", [])
-            if isinstance(features, list):
-                all_unique_features.update(features)
+            feats = h.get("features", [])
+            if isinstance(feats, list):
+                all_unique_features.update(feats)
 
         data_context = {
             "provinces": get_unique_set("province"),
@@ -847,81 +856,113 @@ def build(username: str, conversation: Conversation) -> Lingo:
             "all_available_features": sorted(list(all_unique_features)),
         }
 
-        class FilterParams(BaseModel):
-            stars: Optional[int] = None
-            province: Optional[str] = None
-            municipality: Optional[str] = None
-            location: Optional[str] = None
-            company: Optional[str] = None
-            matched_features: List[str] = []
+        # --- 2. MODELO DE FILTRADO ---
+        class HotelFilters(BaseModel):
+            # INCLUSIONS
+            stars: Optional[int] = Field(None, description="Specific star rating to KEEP.")
+            province: Optional[str] = Field(None, description="Province to KEEP.")
+            municipality: Optional[str] = Field(None, description="Municipality to KEEP.")
+            location: Optional[str] = Field(None, description="Specific location area to KEEP.")
+            company: Optional[str] = Field(None, description="Hotel chain/company to KEEP.")
+            matched_features: List[str] = Field([], description="Features that MUST be present.")
+            
+            # EXCLUSIONS
+            excluded_provinces: List[str] = Field([], description="Provinces to AVOID.")
+            excluded_municipalities: List[str] = Field([], description="Municipalities to AVOID.")
+            excluded_companies: List[str] = Field([], description="Chains/Companies to AVOID.")
+            excluded_features: List[str] = Field([], description="Features to AVOID.")
+            excluded_stars: List[int] = Field([], description="Star ratings to AVOID.")
 
         mapping_prompt = f"""
         USER REQUEST: "{user_criteria}"
         
-        AVAILABLE METADATA (Source of Truth):
+        AVAILABLE METADATA:
         {data_context}
         
         INSTRUCTION:
         Map the USER REQUEST to the EXACT strings found in the AVAILABLE METADATA.
-        If terms are in different languages, match them by semantic meaning.
+        
+        CRITICAL RULES FOR EXCLUSION:
+        1. **Negative Language**: If user says "no", "except", "avoid", or "not in", map to 'excluded_*' fields.
+        
+        2. **Star Ratings (INTENT ANALYSIS)**:
+           - **Analyze the User's Intent**: Is the user avoiding Low Quality or avoiding High Luxury?
+           - Case "No 5 stars" (Avoiding Luxury): Add [5] to `excluded_stars`. Keep 4, 3, 2...
+           - Case "No 1 or 2 stars" (Avoiding Low Quality): Add [1, 2] to `excluded_stars`.
+           - Case "At least 4 stars": Add [1, 2, 3] to `excluded_stars`.
+           - Case "Nothing fancy": Add [5] to `excluded_stars`.
+           
+        3. **Features**: "No pool" -> Add 'pool' to `excluded_features`.
         """
+        
+        params = await engine.create(ctx, HotelFilters, Message.system(mapping_prompt))
+        
+        # --- 3. LÓGICA DE FILTRADO ---
+        refined = []
+        
+        for h in current_results:
+            # Extracción de atributos
+            h_prov = h.get("province", "")
+            h_mun = h.get("municipality", "")
+            h_comp = h.get("company", "")
+            h_stars = h.get("stars")
+            h_feats = h.get("features", [])
+            
+            # --- A. GATEKEEPERS (Exclusiones - Veto Inmediato) ---
+            
+            # Estrellas (Match Exacto para enteros)
+            if params.excluded_stars and h_stars in params.excluded_stars:
+                continue
+                
+            # Ubicación y Cadena (Usando check_any_match global)
+            if params.excluded_provinces and check_any_match(h_prov, params.excluded_provinces): continue
+            if params.excluded_municipalities and check_any_match(h_mun, params.excluded_municipalities): continue
+            if params.excluded_companies and check_any_match(h_comp, params.excluded_companies): continue
+            
+            # Features Excluidas (Usando check_any_match global)
+            if params.excluded_features and check_any_match(h_feats, params.excluded_features):
+                continue
 
-        params = await engine.create(ctx, FilterParams, Message.system(mapping_prompt))
-        refined = current_results
+            # --- B. FILTROS DUROS (Inclusiones) ---
+            if params.stars is not None and h_stars != params.stars: continue
+            
+            # Usamos is_fuzzy_match global para comparaciones individuales
+            if params.province and not is_fuzzy_match(h_prov, params.province): continue
+            if params.municipality and not is_fuzzy_match(h_mun, params.municipality): continue
+            if params.location and not is_fuzzy_match(h.get("location"), params.location): continue
+            if params.company and not is_fuzzy_match(h_comp, params.company): continue
 
-        if params.stars is not None:
-            refined = [h for h in refined if h.get("stars") == params.stars]
+            # --- C. SCORING (Features Positivas) ---
+            # Usamos count_matches global para calcular score
+            match_score = 0
+            if params.matched_features:
+                match_score = count_matches(h_feats, params.matched_features)
+            
+            h["_match_score"] = match_score
+            refined.append(h)
 
-        if params.province:
-            refined = [
-                h for h in refined if is_fuzzy_match(h.get("province"), params.province)
-            ]
+        # --- 4. ORDENAMIENTO Y CIERRE ---
+        # Ordenamos primero por score de features, luego por estrellas
+        refined.sort(key=lambda x: (x.get("_match_score", 0), x.get("stars", 0)), reverse=True)
+        
+        # Recuperamos el docstring original para el reporte (opcional, por consistencia)
+        tool_definition = filter_hotels.__doc__ or "Filters hotel list."
+        tool_definition = tool_definition.strip().replace("\n", " ")
 
-        if params.municipality:
-            refined = [
-                h
-                for h in refined
-                if is_fuzzy_match(h.get("municipality"), params.municipality)
-            ]
-
-        if params.location:
-            refined = [
-                h for h in refined if is_fuzzy_match(h.get("location"), params.location)
-            ]
-
-        if params.company:
-            refined = [
-                h for h in refined if is_fuzzy_match(h.get("company"), params.company)
-            ]
-
-        if params.matched_features:
-            req_features_norm = [f.lower().strip() for f in params.matched_features]
-            scored_candidates = []
-
-            for item in refined:
-                item_features = [f.lower() for f in item.get("features", [])]
-                score = 0
-
-                for req in req_features_norm:
-                    if any(req in feat or feat in req for feat in item_features):
-                        score += 1
-
-                if score > 0:
-                    item["_match_score"] = score
-                    scored_candidates.append(item)
-
-            scored_candidates.sort(key=lambda x: x["_match_score"], reverse=True)
-
-            refined = scored_candidates
-
-        if not refined:
-            logger.warning("Features filter removed all candidates.")
+        execution_summary = (
+            f"TOOL DEFINITION: [{tool_definition}] | "
+            f"ACTION TAKEN: Filtered {len(current_results)} -> {len(refined)} hotels. "
+            f"Active Filters: {params.dict(exclude_none=True, exclude_defaults=True)}"
+        )
 
         return {
-            "total_before": len(current_results),
-            "total_after": len(refined),
-            "applied_filters": params.dict(exclude_none=True),
             "results": refined,
+            "report": {
+                "total_before": len(current_results),
+                "total_after": len(refined),
+                "applied_filters": params.dict(exclude_none=True)
+            },
+            "tool_execution_summary": execution_summary,
         }
 
     @chatbot.tool
@@ -956,59 +997,88 @@ def build(username: str, conversation: Conversation) -> Lingo:
         }
 
     @chatbot.tool
-    async def get_hotel_details(hotel_name: str, **kwargs) -> dict:
+    async def get_hotel_details(
+        hotel_name: str, **kwargs
+    ) -> dict:
         """
         Gets the full information for a specific hotel by name.
         """
-
-        logger.info("Using tool: get_hotel_details")
+        logger.info(f"Using tool: get_hotel_details | Target: '{hotel_name}'")
 
         try:
+            # 1. Recuperamos el contexto del paso actual (step_ctx)
             ctx = active_ctx.get()
             engine = active_engine.get()
-            current_results = active_results.get()
+            
+            # --- LOGICA DE FALLBACK DE DATOS ---
+            # A. Intentamos leer la lista activa (puede estar filtrada o vacía)
+            current_subset = active_results.get() or []
+            
+            # B. Leemos la lista inicial (Fuente de la Verdad / Respaldo)
+            try:
+                initial_set = active_initial_results.get()
+            except LookupError:
+                initial_set = []
+            
+            initial_set = initial_set or []
+            
+            # C. FUSIONAMOS para crear el "Universo de Búsqueda Combinado"
+            # Usamos un dict por 'name' para eliminar duplicados automáticamente
+            combined_map = {h.get("name"): h for h in initial_set}
+            combined_map.update({h.get("name"): h for h in current_subset})
+            
+            current_results = list(combined_map.values())
+
         except LookupError:
-            logger.error(
-                "CRITICAL: ContextVars not set. Calling tool outside proper scope."
-            )
-            return {"error": "Internal Error: Context missing"}
-        if not current_results:
-            logger.warning("Aborting because current_results is empty.")
+            logger.error("CRITICAL: ContextVars not set. Calling tool outside proper scope.")
             return {
-                "details": "Aborting because current results is empty.",
+                "results": {},
+                "report": {"status": "Failure", "reason": "Data Inaccessible"},
+                "tool_execution_summary": "ACTION FAILED: Data context missing."
             }
-
+            
         if not current_results:
             return {
-                "error": "The current result list is empty. Cannot inspect details."
+                "results": {},
+                "report": {"status": "Failure", "reason": "Empty Universe"},
+                "tool_execution_summary": "ACTION ABORTED: No data found in memory (Initial or Current)."
             }
 
-        database_sample = sorted(list({h["name"] for h in current_results}))
+        # --- FASE DE TRADUCCIÓN DE NOMBRE (Semantic Matching) ---
+        database_sample = sorted({
+            h.get("name") for h in current_results 
+            if h.get("name") and str(h.get("name")).strip()
+        })
 
         prompt = f"""
         USER INPUT: "{hotel_name}"
         DATABASE NAME SAMPLES: {database_sample}
         
         TASK: 
-        Translate or adapt the USER INPUT to the exact language and naming convention 
-        used in the DATABASE NAME SAMPLES.
+        Translate or adapt the USER INPUT to the naming convention used in the DATABASE NAME SAMPLES.
+        If the user uses a nickname, map it to the formal name if possible.
         
         INSTRUCTION:
         - Respond ONLY with the translated/mapped name string.
-        - Example: If input is "Parque Central" and samples are in English, return "Central Park".
         """
 
+        # Usamos el ctx del paso actual para que el pensamiento quede aislado
         res = await engine.create(ctx, NameTranslation, Message.system(prompt))
         translated_name = res.translated_name.strip()
+        logger.info(f"Name Translation: '{hotel_name}' -> '{translated_name}'")
 
-        search_options = [hotel_name.lower().strip(), translated_name.lower().strip()]
+        search_options = [
+            hotel_name.lower().strip(),
+            translated_name.lower().strip(),
+        ]
 
         best_match = None
         highest_score = 0
         threshold = 0.75
 
-        for hotel in current_results:
-            official_name = str(hotel.get("name", "")).lower().strip()
+        # --- FASE DE BÚSQUEDA (Fuzzy Logic) ---
+        for item in current_results:
+            official_name = str(item.get("name", "")).lower().strip()
 
             for option in search_options:
                 score = SequenceMatcher(None, option, official_name).ratio()
@@ -1018,23 +1088,42 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
                 if score > highest_score:
                     highest_score = score
-                    best_match = hotel
+                    best_match = item
+
+        # --- FASE DE RESPUESTA ESTANDARIZADA ---
+        tool_definition = get_hotel_details.__doc__ or "Gets full information for a specific hotel."
+        tool_definition = tool_definition.strip().replace("\n", " ").replace("    ", " ")
 
         if best_match and highest_score >= threshold:
-            return {
-                "status": "success",
-                "hotel": best_match,
-                "match_info": {
-                    "original_query": hotel_name,
-                    "translated_query": translated_name,
-                    "confidence": round(highest_score, 2),
-                },
+            execution_summary = (
+                f"TOOL DEFINITION: [{tool_definition}] | "
+                f"ACTION TAKEN: Successfully retrieved full details for '{best_match.get('name')}'."
+            )
+            
+            match_report = {
+                "status": "Match Found",
+                "target": best_match.get('name'),
+                "confidence": round(highest_score, 2),
+                "original_query": hotel_name
             }
-
+        
+            return {
+                "report": match_report,    
+                "results": best_match,     
+                "tool_execution_summary": execution_summary
+            }
+            
+        execution_summary = (
+            f"TOOL DEFINITION: [{tool_definition}] | "
+            f"ACTION FAILED: Attempted to find details for '{hotel_name}' but no match was found."
+        )
+        
         return {
-            "error": f"No reliable match found for '{hotel_name}' in the current set.",
-            "details": "The name could not be resolved semantically or structurally.",
+            "report": {"status": "No Match", "query": hotel_name},
+            "results": {}, 
+            "tool_execution_summary": execution_summary
         }
+
 
     @chatbot.tool
     async def search_restaurants_by_description(
