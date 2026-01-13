@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field, create_model
 from typing import List, Optional, Dict, Any
 from beaver import BeaverDB
 from enum import Enum
+from .utils import CUBAN_GEOGRAPHY
 import logging
 import re
 import contextvars
 import copy
+from datetime import datetime 
 
 
 logging.basicConfig(
@@ -23,19 +25,20 @@ logger = logging.getLogger(__name__)
 STD_REPLY_INSTRUCTION = "Answer in the same language the user is currently using."
 
 ANTI_HALLUCINATION_GUARD = (
-    "CRITICAL TRUTH PROTOCOL: "
-    "1. Your knowledge is STRICTLY LIMITED to the provided 'BASE DATASET' and 'TOOLS_EXECUTION_LOG'. "
-    "2. If the specific information (address, price, menu item) is NOT present in the provided JSON data, "
-    "   you MUST explicitly state: 'I do not have that information in my current records'. "
-    "3. DO NOT HALLUCINATE. It is forbidden to invent phone numbers, locations, or details not visible in the context. "
-    "4. If the tools failed or returned empty lists, admit that you could not find the place."
+    "DATA INTEGRITY PROTOCOL: "
+    "1. HIERARCHY (The Selector): "
+    "   - Priority A (Primary): Start with 'TOOLS_EXECUTION_LOG' as your trusted list of filtered candidates. "
+    "   - Priority B (Expansion): If the log is empty, failed, or yields too few results to be helpful, you ARE PERMITTED to retrieve additional matching candidates directly from 'INVENTORY_DATA'. "
+    "2. ENRICHMENT (The Source): Always use 'INVENTORY_DATA' to look up specific attributes for ANY item you choose to mention. "
+    "3. ATOMICITY (No Bleeding): Treat each entity as an isolated record. NEVER copy an address, phone, or detail or any attribute from Entity A to fill a gap in Entity B. "
+    "4. SILENCE ON MISSING DATA: If a specific detail (like address) is missing for an item, simply OMIT it. Do not write 'Not available'."
 )
-
 
 active_ctx = contextvars.ContextVar("active_ctx")
 active_engine = contextvars.ContextVar("active_engine")
 active_results = contextvars.ContextVar("active_results")
 active_initial_results = contextvars.ContextVar("active_initial_results")
+
 
 
 def build(username: str, conversation: Conversation) -> Lingo:
@@ -114,7 +117,12 @@ def build(username: str, conversation: Conversation) -> Lingo:
         context_scope: ContextScope = Field(
             description="How should previous constraints apply to this new query?"
         )
-        search_query: str = Field(description="The extracted query string.")
+        search_query: str = Field(description="The extracted query string based on context.")
+        
+        requires_proximity: bool = Field(
+            default=False, 
+            description="True ONLY if the user explicitly implies a search relative to their CURRENT PHYSICAL LOCATION (e.g., 'near me', 'around here', 'closest'). False for generic queries."
+        )
 
     async def get_user_intent(ctx: Context, engine: Engine) -> UserIntent:
         """
@@ -138,6 +146,10 @@ def build(username: str, conversation: Conversation) -> Lingo:
         3. 'isolated' (Entity Focus):
         - The user targets a SPECIFIC NAMED ENTITY (Proper Noun) for identification or inspection.
         - The goal is depth (facts about one) rather than breadth (list of many).
+        
+        SPECIAL INSTRUCTION FOR 'requires_proximity':
+        - Set to TRUE if the user uses phrases like "near me", "close to here", "around my location", or "nearby".
+        - Set to FALSE if the user specifies a named location (e.g. "in Vedado", etc    ) or asks generally (eg, "Recommend a hotel", "comment about restaurants", etc).
 
         Extract the core 'search_query' reflecting this new state and explain your 'reasoning'.
         
@@ -284,24 +296,204 @@ def build(username: str, conversation: Conversation) -> Lingo:
             ],
         )
 
-    @chatbot.skill
-    async def city_explorer(ctx: Context, engine: Engine):
+    class GeoResolution(BaseModel):
+        """Modelo para la salida estructurada del LLM en la normalización geográfica."""
+        official_name: Optional[str] = Field(
+            None, 
+            description="The exact string from the Official List matching the input."
+        )
+        is_valid: bool = Field(
+            ..., 
+            description="True if the input maps to a real, valid Cuban municipality from the provided list."
+        )
+
+    async def resolve_municipality_semantic(ctx: Context, engine: Engine, user_input: str) -> Optional[str]:
         """
-        Architect of Itineraries and Spatial Logic within the Hospitality Network.
-
-        DATA BOUNDARY:
-        - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
-
-        RESPONSIBILITY:
-        - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
-        - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
-
-        NEGATIVE CONSTRAINTS (Intrinsic Limit):
-        - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
-        - **Item Specs**: Does not handle menus or room prices (Micro-level data).
+        SHARED HELPER: Normalizes any input (alias, typo, language) to an Official Cuban Municipality.
+        
+        Args:
+            ctx: Current Lingo Context.
+            engine: Lingo Engine for LLM execution.
+            user_input: The raw string from the user (e.g., "Old Havana", "Varadero", "el vedado").
+            
+        Returns:
+            The exact Official Municipality name (str) or None if unresolvable/invalid.
         """
+        if not user_input or not user_input.strip(): 
+            return None
 
-        logger.info("Skill: CityExplorerSkill")
+        all_munis = [m for sublist in CUBAN_GEOGRAPHY.values() for m in sublist]
+        
+        prompt = f"""
+        TASK: Geographic Normalization.
+        INPUT: "{user_input}"
+        OFFICIAL CUBAN MUNICIPALITIES: {all_munis}
+        
+        INSTRUCTIONS:
+        1. Analyze the INPUT semantically. It may be a city, a neighborhood, a typo, or in another language.
+        2. Map it to the EXACT string in the OFFICIAL LIST that contains this location.
+        3. Examples of Logic: 
+        - "Old Havana" -> "La Habana Vieja"
+        - "Vedado" -> "Plaza de la Revolución" (Vedado is a neighborhood in Plaza)
+        - "Varadero" -> "Cárdenas" (Varadero is a zone in Cárdenas)
+        - "Cayo Santa María" -> "Caibarién"
+        4. If the input is NOT in Cuba or cannot be mapped to the list, set is_valid=False.
+        """
+        
+        try:
+            res = await engine.create(ctx, GeoResolution, Message.system(prompt))
+            
+            if res.is_valid and res.official_name:
+                if res.official_name in all_munis:
+                    return res.official_name
+                
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in resolve_municipality_semantic: {e}")
+            return None
+            
+        return None
+    
+    class SpatialIntentType(str, Enum):
+        """Defines the core spatial action."""
+        SELF_LOC = "SELF_LOC"       
+        ANCHOR_LOC = "ANCHOR_LOC"   
+
+    class SpatialAnchorType(str, Enum):
+        """
+        Defines the category of the reference point.
+        CRITICAL: The value MUST match the exact Collection Name in the Vector DB.
+        """
+        HOTEL = "hotels"           
+        RESTAURANT = "restaurants" 
+        PERSON = "person"
+
+    class SpatialIntent(BaseModel):
+        """Structure to extract spatial intent based on SEMANTIC ROLES."""
+        intent_type: SpatialIntentType = Field(
+            ..., 
+            description="The semantic goal: 'SELF_LOC' (User defines their own position) or 'ANCHOR_LOC' (User searches relative to an external entity)."
+        )
+        target_entities: List[str] = Field(
+            ..., 
+            description="The NAMED ENTITIES acting as SPATIAL REFERENCES.\n"
+            "- In SELF_LOC: The place the user is located at.\n"
+            "- In ANCHOR_LOC: The fixed Landmark/Entity used as the center of the search (The Anchor).\n"
+            "CRITICAL: Extract ONLY Proper Nouns (e.g., 'Hotel Nacional', 'Restaurant El Idilio', 'National Museum of Fine Arts', etc). DISCARD generic categories (The 'What')."
+        )
+        anchor_type: Optional[SpatialAnchorType] = Field(
+            default=SpatialAnchorType.HOTEL, 
+            description="The Inferred Category of the Reference Entity. (Only for ANCHOR_LOC. For SELF_LOC use 'person')."
+        )
+
+    async def get_spatial_intent(ctx: Context, engine: Engine) -> SpatialIntent:
+        """
+        Analyzes the user's input using SEMANTIC ROLE LABELING (Not Grammar).
+        It identifies if the user is establishing their position or referencing another entity.
+        """
+        # Tipos válidos para referencias externas
+        entity_types = [t.value for t in SpatialAnchorType if t.value != 'person']
+        
+        prompt = f"""
+        TASK: Semantic Analysis of Spatial Intent.
+        
+        Analyze the MEANING of the user's input, ignoring grammatical order or language (English/Spanish).
+        Classify into one of two SEMANTIC MODES:
+        
+        === MODE 1: ESTABLISHING PRESENCE (SELF_LOC) ===
+        INTENT: The user is defining their current physical context.
+        SIGNALS:
+        - Explicit Statement: User says they are at a location.
+        - Direct Answer: User provides a location name in response to a previous question (e.g., "Where are you?" -> "Plaza").
+        - Contextual Assertion: "We are staying in Marianao".
+        
+        ACTION:
+        - intent_type: 'SELF_LOC'
+        - anchor_type: 'person' (ALWAYS, because the anchor is the user).
+        - target_entities: The Named Location provided.
+        
+        === MODE 2: REFERENTIAL SEARCH (ANCHOR_LOC) ===
+        INTENT: The user wants to find [Something Variable] relative to [A Fixed Entity/Anchor].
+        
+        SEMANTIC DISTINCTION TASK:
+        - THE VARIABLE (Target): The generic category being sought (e.g., "restaurants", "places to dance", "pharmacies"). -> IGNORE THIS.
+        - THE CONSTANT (Anchor): The specific Named Entity acting as the reference point (e.g., "Hotel Nacional", "The Capitol", "Parque Central"). -> EXTRACT THIS.
+        
+        AVAILABLE ANCHOR TYPES: {entity_types}
+        
+        ACTION:
+        - intent_type: 'ANCHOR_LOC'
+        - target_entities: Extract ONLY THE CONSTANT (The Specific Entity Name).
+        - anchor_type: Infer the category of the Constant (Is it a hotel? A museum?).
+        
+        ---
+        SEMANTIC EXAMPLES (Focus on Logic, not Sentence Structure):
+        
+        Ex 1 (Simple Answer):
+        Input: "La Lisa"
+        Logic: No search variable present. Likely an answer to a location question.
+        Output: intent_type='SELF_LOC', target_entities=['La Lisa']
+        
+        Ex 2 (Relative Search - Standard):
+        Input: "Find restaurants near Hotel Nacional)
+        Logic: Variable="restaurants" (Ignore). Constant="Hotel Nacional" (Extract).
+        Output: intent_type='ANCHOR_LOC', anchor_type='hotels', target_entities=['Hotel Nacional']
+        
+        Ex 3 (Relative Search - Inverted/Complex):
+        Input: "Close to Floridita, what lodging options do I have?"
+        Logic: Variable="lodging/options" (Ignore). Constant="Floridita" (Extract).
+        Output: intent_type='ANCHOR_LOC', anchor_type='restaurants', target_entities=['Floridita']
+        
+        Ex 4 (Action-Based):
+        Input: "Where can I eat something around Marti Theater"
+        Logic: Variable="eat/something" (Ignore). Constant="Marti Hotel" (Extract).
+        Output: intent_type='ANCHOR_LOC', anchor_type='theaters', target_entities=['Teatro Martí']
+
+        FINAL RULE:
+        If the input contains specific names of geographic place but NO intent to search FOR something else relative to them, assume MODE 1 (SELF_LOC).
+        """
+        return await engine.create(ctx, SpatialIntent, Message.system(prompt))
+    
+    def check_location_freshness(ctx: Context, max_hours: float = 4.0) -> tuple[bool, Optional[str]]:
+        """Scans context for USER_LOCATION. Returns (is_fresh, municipality_name)."""
+        now = datetime.now()
+        for msg in reversed(ctx.messages):
+            if msg.role == "system" and "USER_LOCATION:" in msg.content:
+                mun_match = re.search(r"USER_LOCATION:\s*(.*?)\s*\[", msg.content)
+                if not mun_match: continue
+                municipality = mun_match.group(1).strip()
+                
+                time_match = re.search(r"Recorded at:\s*([\d-]+\s[\d:]+)", msg.content)
+                if time_match:
+                    try:
+                        rec_time = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S")
+                        age = (now - rec_time).total_seconds() / 3600
+                        if age <= max_hours:
+                            return True, municipality
+                    except ValueError:
+                        pass
+                return False, municipality 
+        return False, None 
+    
+    # @chatbot.skill
+    # async def city_explorer(ctx: Context, engine: Engine):
+    #     """
+    #     Architect of Itineraries and Spatial Logic within the Hospitality Network.
+
+    #     DATA BOUNDARY:
+    #     - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
+
+    #     RESPONSIBILITY:
+    #     - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
+    #     - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
+
+    #     NEGATIVE CONSTRAINTS (Intrinsic Limit):
+    #     - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
+    #     - **Item Specs**: Does not handle menus or room prices (Micro-level data).
+    #     """
+
+    #     logger.info("Skill: CityExplorerSkill")
 
     @chatbot.skill
     async def concierge(ctx: Context, engine: Engine):
@@ -344,6 +536,29 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
                     logger.info("Concierge - Getting intent")
                     intent = await get_user_intent(fork_ctx, engine)
+                    logger.info(f"Concierge - intent {str(intent)}")
+                    
+                    logger.info("Concierge - Checking proximity user information")
+                    if intent.requires_proximity:
+                        is_fresh, loc_name = check_location_freshness(fork_ctx)
+                        
+                        if not is_fresh:
+                            logger.info("Proximity required but location missing/stale. Triggering WAITING_LOCATION.")
+                            
+                            ctx.append(Message.system(
+                                f"SYSTEM_STATE: STATUS='WAITING_LOCATION' QUERY='{intent.search_query}'"
+                            ))
+                            
+                            prompt_ask = "Ask the user for their current location (municipality) to find places nearby."
+                            if loc_name: 
+                                prompt_ask = f"The user was at '{loc_name}' previously but data is stale. Ask if they are still there or moved."
+                                
+                            msg = await engine.reply(fork_ctx, prompt_ask, STD_REPLY_INSTRUCTION)
+                            ctx.append(msg)
+                            return 
+                        
+                        else:
+                            logger.info(f"Proximity valid. Using stored location: {loc_name}")
 
                     logger.info("Concierge - Getting limit")
                     limit_count = await get_search_limit(fork_ctx, engine)
@@ -387,7 +602,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         fork_ctx.append(Message.system(memory_directive))
                         fork_ctx.append(
                             Message.system(
-                                f"BASE DATASET (Source of Truth): {candidates}"
+                                f"INVENTORY_DATA (Detailed attributes for reference): {candidates}"
                             )
                         )
 
@@ -503,12 +718,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
                                     )
                                 )
 
-                            combined_instruction = (
-                                STD_REPLY_INSTRUCTION + " " + ANTI_HALLUCINATION_GUARD
-                            )
-
                             final_response_msg = await engine.reply(
-                                response_ctx, intent.search_query, combined_instruction
+                                response_ctx, intent.search_query, STD_REPLY_INSTRUCTION, ANTI_HALLUCINATION_GUARD
                             )
 
                         finally:
@@ -572,6 +783,28 @@ def build(username: str, conversation: Conversation) -> Lingo:
                     logger.info("GastroGuideSkill - Getting intent")
                     intent = await get_user_intent(fork_ctx, engine)
                     logger.info(f"GastroGuideSkill - intent {str(intent)}")
+                    
+                    logger.info("Concierge - Checking proximity user information")
+                    if intent.requires_proximity:
+                        is_fresh, loc_name = check_location_freshness(fork_ctx)
+                        
+                        if not is_fresh:
+                            logger.info("Proximity required but location missing/stale. Triggering WAITING_LOCATION.")
+                            
+                            ctx.append(Message.system(
+                                f"SYSTEM_STATE: STATUS='WAITING_LOCATION' QUERY='{intent.search_query}'"
+                            ))
+                            
+                            prompt_ask = "Ask the user for their current location (municipality)  to find places nearby."
+                            if loc_name: 
+                                prompt_ask = f"The user was at '{loc_name}' previously but data is stale. Ask if they are still there or moved."
+                                
+                            msg = await engine.reply(fork_ctx, prompt_ask, STD_REPLY_INSTRUCTION)
+                            ctx.append(msg)
+                            return 
+                        
+                        else:
+                            logger.info(f"Proximity valid. Using stored location: {loc_name}")
 
                     logger.info("GastroGuideSkill - Getting limit")
                     limit_count = await get_search_limit(fork_ctx, engine)
@@ -618,7 +851,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         fork_ctx.append(Message.system(memory_directive))
                         fork_ctx.append(
                             Message.system(
-                                f"BASE DATASET (Source of Truth): {candidates}"
+                                f"INVENTORY_DATA (Detailed attributes for reference): {candidates}"
                             )
                         )
 
@@ -771,15 +1004,131 @@ def build(username: str, conversation: Conversation) -> Lingo:
     @chatbot.skill
     async def location_manager(ctx: Context, engine: Engine):
         """
-        DOMAIN: Spatial Relations and Multi-Entity Plans.
+        DOMAIN: Spatial Logic & Context Resolution.
 
-        AUTHORITY: This domain activates when the user intent focuses on the NEXUS or
-        CONNECTION between two or more points (e.g., "A near B", "Route from A to B").
-        It is responsible for the relationship between entities, regardless of their type.
+        AUTHORITY & TRIGGER LOGIC:
+        1. SELF-LOCALIZATION:
+           - User says "I am in X" or answers "X" to "Where are you?".
+           - Action: Updates USER_LOCATION and triggers a re-evaluation if a task was pending.
+
+        2. CROSS-DOMAIN ANCHORING (Different Entity Types ONLY):
+           - User asks for "Entities of Type A near Entity of Type B" (e.g., "Hotels near [Restaurant Name]").
+           - DATA BOUNDARY: This resolution is STRICTLY LIMITED to the known inventory of **Hotels** and **Restaurants**. 
+             Do not attempt to resolve locations for banks, hospitals, or generic infrastructure unless they are named entities in these categories.
+           - CRITICAL EXCLUSION: DO NOT activate for SAME-TYPE queries (e.g., "Hotels near Hotel X" or "Restaurants near Restaurant Y").
+             Those are handled by internal filters within the specific domains.
         """
-
         logger.info("Skill: LocationManagerSkill")
 
+        loc_tool = next((t for t in chatbot.tools if t.name == "set_user_location"), None)
+        find_tool = next((t for t in chatbot.tools if t.name == "find_places_location"), None)
+
+        if not loc_tool or not find_tool:
+            logger.error("CRITICAL: Location tools not found in chatbot configuration.")
+            await engine.reply(ctx, "System Error: Location tools are missing.", STD_REPLY_INSTRUCTION)
+            return
+
+        intent = await get_spatial_intent(ctx, engine)
+
+        if intent.intent_type == SpatialIntentType.SELF_LOC:
+            target = intent.target_entities[0] if intent.target_entities else ""
+            
+            if not target:
+                msg = await engine.reply(ctx, "Ask the user to repeat the location because it was not clear.", STD_REPLY_INSTRUCTION)
+                ctx.append(msg)
+                return
+
+            await engine.invoke(ctx, loc_tool, municipality=target)
+
+            is_set = any("USER_LOCATION:" in m.content for m in ctx.messages[-2:])
+            if not is_set:
+                msg = await engine.reply(
+                    ctx, 
+                    "Inform the user that the provided location is not recognized as a valid Cuban municipality and ask for clarification.", 
+                    STD_REPLY_INSTRUCTION
+                )
+                ctx.append(msg)
+                return
+
+            pending_query = None
+            for msg in reversed(ctx.messages):
+                if msg.role == "system" and "SYSTEM_STATE: STATUS='WAITING_LOCATION'" in msg.content:
+                    query_match = re.search(r"QUERY='(.*?)'", msg.content)
+                    if query_match:
+                        pending_query = query_match.group(1)
+                        break
+
+            if pending_query:
+                logger.info(f"Location Fixed. Re-executing pending query: {pending_query}")
+                ctx.append(Message.system(
+                    f"ROUTING_DIRECTIVE: Location resolved. ACTION REQUIRED: Resume execution for pending query: '{pending_query}' with the user location (municipality)."
+                ))
+                main_flow = chatbot._build_flow()
+                await main_flow.execute(ctx, engine)
+                return
+
+            msg = await engine.reply(
+                ctx, 
+                f"Confirm that the location has been set to '{target}' and ask the user what they would like to do next.", 
+                STD_REPLY_INSTRUCTION
+            )
+            ctx.append(msg)
+            return
+
+        elif intent.intent_type == SpatialIntentType.ANCHOR_LOC:
+            resolved_areas = set()
+            resolution_log = []
+
+            for anchor in intent.target_entities:
+                res = await engine.invoke(
+                    ctx,
+                    find_tool,
+                    place_name=anchor,
+                    place_type=intent.anchor_type.value
+                )
+                
+                if res and res.result and res.result.get("municipality"):
+                    mun = res.result["municipality"]
+                    resolved_areas.add(mun)
+                    resolution_log.append(f"{anchor}->{mun}")
+                else:
+                    logger.warning(f"Could not resolve anchor: {anchor}")
+
+            if resolved_areas:
+                areas_list = list(resolved_areas)
+                
+                pending_query = next(
+                    (m.content for m in reversed(ctx.messages) if m.role == "user"), 
+                    "User request not found"
+                )
+
+                ctx.append(Message.system(
+                    f"SPATIAL_CONTEXT: User targets areas (municipalities): {areas_list}. "
+                    f"SOURCE: Derived from cross-domain anchors {intent.target_entities}. Log: {resolution_log}"
+                    f"[Context Hint: The active search MUNICIPALITY should match one of {areas_list}]"
+                ))
+
+                ctx.append(Message.system(
+                    f"STATUS: Location resolution is COMPLETE. "
+                    f"ROUTING_DIRECTIVE: Spatial context (municipalities) is SET to {areas_list}. "
+                    f"ACTION REQUIRED: Resume execution for pending query: '{pending_query}' applying the new area constraints. "
+                ))
+
+                logger.info("Spatial Context Set. Handing over to Router.")
+                main_flow = chatbot._build_flow()
+                await main_flow.execute(ctx, engine)
+                return
+
+            else:
+                msg = await engine.reply(
+                    ctx, 
+                    f"Inform the user that the places {intent.target_entities} could not be located in the inventory. Ask them to provide the municipality manually.", 
+                    STD_REPLY_INSTRUCTION
+                )
+                ctx.append(msg)
+                return
+    
+    
     @chatbot.skill
     async def casual_chat(ctx: Context, engine: Engine):
         """
@@ -836,7 +1185,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 "tool_execution_summary": "ACTION ABORTED: No hotels to filter (Input list empty).",
             }
 
-        # --- 1. PREPARACIÓN DE METADATA ---
         def get_unique_set(key: str) -> List[Any]:
             return sorted(
                 list({h.get(key) for h in current_results if h.get(key) is not None})
@@ -857,9 +1205,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
             "all_available_features": sorted(list(all_unique_features)),
         }
 
-        # --- 2. MODELO DE FILTRADO ---
         class HotelFilters(BaseModel):
-            # INCLUSIONS
             stars: Optional[int] = Field(
                 None, description="Specific star rating to KEEP."
             )
@@ -877,7 +1223,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 [], description="Features that MUST be present."
             )
 
-            # EXCLUSIONS
             excluded_provinces: List[str] = Field([], description="Provinces to AVOID.")
             excluded_municipalities: List[str] = Field(
                 [], description="Municipalities to AVOID."
@@ -912,24 +1257,18 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         params = await engine.create(ctx, HotelFilters, Message.system(mapping_prompt))
 
-        # --- 3. LÓGICA DE FILTRADO ---
         refined = []
 
         for h in current_results:
-            # Extracción de atributos
             h_prov = h.get("province", "")
             h_mun = h.get("municipality", "")
             h_comp = h.get("company", "")
             h_stars = h.get("stars")
             h_feats = h.get("features", [])
 
-            # --- A. GATEKEEPERS (Exclusiones - Veto Inmediato) ---
-
-            # Estrellas (Match Exacto para enteros)
             if params.excluded_stars and h_stars in params.excluded_stars:
                 continue
 
-            # Ubicación y Cadena (Usando check_any_match global)
             if params.excluded_provinces and check_any_match(
                 h_prov, params.excluded_provinces
             ):
@@ -943,17 +1282,14 @@ def build(username: str, conversation: Conversation) -> Lingo:
             ):
                 continue
 
-            # Features Excluidas (Usando check_any_match global)
             if params.excluded_features and check_any_match(
                 h_feats, params.excluded_features
             ):
                 continue
 
-            # --- B. FILTROS DUROS (Inclusiones) ---
             if params.stars is not None and h_stars != params.stars:
                 continue
 
-            # Usamos is_fuzzy_match global para comparaciones individuales
             if params.province and not is_fuzzy_match(h_prov, params.province):
                 continue
             if params.municipality and not is_fuzzy_match(h_mun, params.municipality):
@@ -965,8 +1301,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
             if params.company and not is_fuzzy_match(h_comp, params.company):
                 continue
 
-            # --- C. SCORING (Features Positivas) ---
-            # Usamos count_matches global para calcular score
             match_score = 0
             if params.matched_features:
                 match_score = count_matches(h_feats, params.matched_features)
@@ -974,13 +1308,10 @@ def build(username: str, conversation: Conversation) -> Lingo:
             h["_match_score"] = match_score
             refined.append(h)
 
-        # --- 4. ORDENAMIENTO Y CIERRE ---
-        # Ordenamos primero por score de features, luego por estrellas
         refined.sort(
             key=lambda x: (x.get("_match_score", 0), x.get("stars", 0)), reverse=True
         )
 
-        # Recuperamos el docstring original para el reporte (opcional, por consistencia)
         tool_definition = filter_hotels.__doc__ or "Filters hotel list."
         tool_definition = tool_definition.strip().replace("\n", " ")
 
@@ -1585,16 +1916,104 @@ def build(username: str, conversation: Conversation) -> Lingo:
         }
 
     @chatbot.tool
-    async def find_place_municipality(place_name: str):
+    async def find_places_location(place_name: str, place_type: str, **kwargs) -> dict:
         """
-        Searches for a place by name (Fuzzy) to find its Municipality.
+        Identifies the geographic location (municipality) of a specific entity (Anchor).
+        
+        Args:
+            place_name: The specific name of the entity.
+            place_type: The Vector DB Collection name (derived directly from SpatialAnchorType Enum).
         """
-        pass
+        collection = place_type.lower().strip()
+        logger.info(f"Tool: find_places_location | Searching: '{place_name}' | Collection: '{collection}'")
+
+        valid_collections = {
+            member.value for member in SpatialAnchorType 
+            if member.value != "person"
+        }
+
+        if collection not in valid_collections:
+             return {
+                "status": "ERROR",
+                "reason": f"Invalid collection '{collection}'. Available DB collections: {valid_collections}"
+            }
+
+        candidates_docs = await _vector_search(collection, place_name, limit=5)
+        
+        if not candidates_docs:
+            return {
+                "status": "NOT_FOUND",
+                "reason": f"No vector matches found in collection '{collection}'."
+            }
+
+        best_match = None
+        best_score = 0.0
+        SCORE_THRESHOLD = 0.80
+
+        target_name_clean = place_name.lower().strip()
+
+        for doc in candidates_docs:
+            item = doc[0].body
+            item_name = str(item.get("name", "")).lower().strip()
+            
+            if target_name_clean == item_name:
+                score = 1.0
+            elif target_name_clean in item_name or item_name in target_name_clean:
+                score = 0.90 
+            else:
+                score = SequenceMatcher(None, target_name_clean, item_name).ratio()
+
+            if score > best_score:
+                best_score = score
+                best_match = item
+
+        if best_match and best_score >= SCORE_THRESHOLD:
+            logger.info(f"Match Found: '{best_match.get('name')}' (Score: {best_score:.2f})")
+            return {
+                "status": "FOUND_IN_DB",
+                "municipality": best_match.get("municipality"),
+                "place_name": best_match.get("name"),
+                "province": best_match.get("province"),
+                "confidence_score": round(best_score, 2),
+                "source_collection": collection
+            }
+        
+        logger.warning(f"No Match: Best candidate '{best_match.get('name') if best_match else 'None'}' score {best_score:.2f} < threshold")
+        
+        return {
+            "status": "NOT_FOUND",
+            "reason": f"Entity not found in '{collection}'. Best match ({best_score:.2f}) was insufficient.",
+            "closest_candidate": best_match.get("name") if best_match else None
+        }
 
     @chatbot.tool
     async def set_user_location(municipality: str):
         """
-        Updates the user's current location context.
+        Sets or updates the official USER_LOCATION in the context with a TIMESTAMP.
+        Crucial for tracking if the location data is fresh or stale.
         """
+        try:
+            ctx = active_ctx.get()
+            engine = active_engine.get()
+        except LookupError:
+            return
+
+        official_mun = await resolve_municipality_semantic(ctx, engine, municipality)
+        
+        if official_mun:
+            ctx.messages = [
+                m for m in ctx.messages 
+                if not (m.role == "system" and "USER_LOCATION:" in m.content)
+            ]
+            
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            ctx.append(Message.system(
+                f"USER_LOCATION: {official_mun} [Recorded at: {current_time}]"
+                f"[Context Hint: The user is located in MUNICIPALITY='{official_mun}']"
+            ))
+            
+            logger.info(f"Context Updated: USER_LOCATION set to '{official_mun}' at {current_time}")
+
 
     return chatbot
