@@ -106,6 +106,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         RESET = "reset"
         REFINE = "refine"
         ISOLATED = "isolated"
+        BACK_REFERENCE = "back_ref"
 
     class UserIntent(BaseModel):
         """Structure to extract intent"""
@@ -132,29 +133,37 @@ def build(username: str, conversation: Conversation) -> Lingo:
         or focusing on a specific item (ISOLATED).
         """
         prompt = """
-        Analyze the CONVERSATIONAL DYNAMICS between the User's last message and the History.
+        Analyze the CONVERSATIONAL DYNAMICS.
         
         CLASSIFY THE INTERACTION MODE ('context_scope'):
         
-        1. 'reset' (New Topic/Disjoint):
-        - The semantic subject changes completely (e.g., from "Hotels" to "Food", or "Beaches" to "Museums").
-        - Previous constraints are logically disjoint and should be discarded.
+        1. 'reset' (New Topic):
+           - Subject changes completely (e.g., from "Hotels" to "Food").
+           - Previous constraints are logically disjoint.
+           - ACTION: Output the FULL STANDALONE QUERY (e.g. "Pizza in Vedado").
         
         2. 'refine' (Constraint Injection):
-        - The subject remains the same, but the user adds conditions (e.g., "cheaper", "closer", "with pool").
-        - The intent is to narrow down the current set.
+           - Subject is the SAME as the IMMEDIATE previous turn.
+           - User adds conditions ("cheaper", "with pool") or navigates ("show more").
+           - ACTION: Output ONLY the new condition/modifier (e.g. "cheaper").
         
-        3. 'isolated' (Entity Focus):
-        - The user targets a SPECIFIC NAMED ENTITY (Proper Noun) for identification or inspection.
-        - The goal is depth (facts about one) rather than breadth (list of many).
+        3. 'back_ref' (History Recall / Time Travel):
+           - User refers to a PAST topic explicitly (NOT the immediate one).
+           - Example: "Let's go back to the hotels", "About the first option you showed".
+           - CRITICAL TASK: You must RECONSTRUCT the original search query from the history and output it in 'search_query'.
+           - ACTION: Output the FULL STANDALONE QUERY representing that past state (e.g. "Hotels in Varadero").
+        
+        4. 'isolated' (Entity Focus):
+           - Target specific named entity for details.
         
         SPECIAL INSTRUCTION FOR 'requires_proximity':
-        - CONCEPT: Determine the ANCHOR POINT of the spatial search.
-        - TRUE (User-Centric): The user wants results relative to THEIR OWN PHYSICAL POSITION (Self-Referential).
-             * Examples: "closest to me", "around here", "within walking distance", "nearby" (implied here), "in my area".
-        - FALSE (Entity-Centric or Generic): 
-             * Case A: The search is relative to a THIRD-PARTY ENTITY (e.g., "close to the Hotel", "near the Cathedral", "minutes from the airport"). -> Anchor is the Entity, NOT the user.
-             * Case B: The search is generic or absolute (e.g., "in Havana", "in Vedado", "best restaurants").
+            - CONCEPT: Determine the ANCHOR POINT of the spatial search.
+            - TRUE (User-Centric): The user wants results relative to THEIR OWN PHYSICAL POSITION (Self-Referential).
+                * Examples: "closest to me", "around here", "within walking distance", "nearby" (implied here), "in my area".
+            - FALSE (Entity-Centric or Generic): 
+                * Case A: The search is relative to a THIRD-PARTY ENTITY (e.g., "close to the Hotel", "near the Cathedral", "minutes from the airport"). -> Anchor is the Entity, NOT the user.
+                * Case B: The search is generic or absolute (e.g., "in Havana", "in Vedado", "best restaurants").
+        
         Extract the core 'search_query' reflecting this new state and explain your 'reasoning'.
         
         Your response MUST BE IN ENGLISH
@@ -661,6 +670,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         memory_directive = ""
                         if intent.context_scope == ContextScope.RESET:
                             memory_directive = "MEMORY STATUS: RESET. User changed topic. Ignore previous conversation constraints."
+                        elif intent.context_scope == ContextScope.BACK_REFERENCE:
+                            memory_directive = "MEMORY STATUS: RESTORED. User recalls a past topic. Treat the current Search Query as the full definition."
                         elif intent.context_scope == ContextScope.ISOLATED:
                             memory_directive = "MEMORY STATUS: ISOLATED. User targets a specific entity. Ignore previous list filtering constraints."
                         else:
@@ -938,6 +949,8 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         memory_directive = ""
                         if intent.context_scope == ContextScope.RESET:
                             memory_directive = "MEMORY STATUS: RESET. User changed topic. Ignore previous conversation constraints."
+                        elif intent.context_scope == ContextScope.BACK_REFERENCE:
+                            memory_directive = "MEMORY STATUS: RESTORED. User recalls a past topic. Treat the current Search Query as the full definition."
                         elif intent.context_scope == ContextScope.ISOLATED:
                             memory_directive = "MEMORY STATUS: ISOLATED. User targets a specific entity. Ignore previous list filtering constraints."
                         else:
