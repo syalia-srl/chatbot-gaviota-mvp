@@ -407,31 +407,32 @@ def build(username: str, conversation: Conversation) -> Lingo:
         Returns:
             The exact Official Municipality name (str) or None if unresolvable/invalid.
         """
+        logger.info("¨Checking fo municipality")
         if not user_input or not user_input.strip():
             return None
 
         all_munis = [m for sublist in CUBAN_GEOGRAPHY.values() for m in sublist]
 
         prompt = f"""
-        TASK: Geographic Normalization for Cuba.
-        INPUT: "{user_input}"
-        OFFICIAL LIST: {all_munis}
+        TASK: Entity Resolution for Cuban Administrative Divisions.
+        USER INPUT: "{user_input}"
+        OFFICIAL VALID LIST: {all_munis}
         
         INSTRUCTIONS:
-        1. Identify the intended municipality. Treat inputs like "Plaza", "Vedado" as "Plaza de la Revolución".
-        2. Map to the EXACT string in the OFFICIAL LIST.
-        
-        CRITICAL ALIAS MAPPINGS:
-        - "Plaza" -> "Plaza de la Revolución"
-        - "Centro" -> "Centro Habana"
-        - "Habana Vieja" -> "Habana Vieja" (Sometimes users say "Old Havana")
-        - "Playa" -> "Playa" (Miramar is in Playa)
-        - "Varadero" -> "Cárdenas"
-        
+        1. **EXTRACTION**: The input may be a full sentence (e.g., "I am in Playa", "Voy para Ciego"). First, extract the substring that represents the location.
+        2. **MATCHING**: If the extracted substring matches (strictly or fuzzily) to any of the EXACT string found in the OFFICIAL VALID LIST THEN Map that extracted substring to the EXACT string found in the OFFICIAL VALID LIST.
+        3. **DISAMBIGUATION (CRITICAL)**: 
+           - Some valid municipality names or short names are also common nouns (e.g., "Playa", "Plaza" (for Plaza de la Revolución), "Centro" (for Centro Habana)).
+           - RULE: If the extracted word exists in the OFFICIAL VALID LIST (e.g., "Playa" is in the list), YOU MUST RETURN IT AS VALID. Do not treat it as a generic place (beach/square) if it matches a Proper Noun in the list.
+        4. **NORMALIZATION**:
+           - Handle short forms: "Ciego" -> "Ciego de Ávila", "La Isla" -> "Isla de la Juventud".
+           - Handle neighborhoods: "Vedado" -> "Plaza de la Revolución".
+           - Handle typos: "Varadero" -> "Cárdenas".
+
         OUTPUT RULES:
         - Return ONLY the official JSON.
-        - valid: boolean.
-        - official_name: string.
+        - valid: boolean (True if it maps to a real municipality).
+        - official_name: string (MUST be the EXACT copy of the string from the OFFICIAL LIST).
         """
 
         try:
@@ -518,6 +519,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
         - Explicit Statement: User says they are at a location.
         - Direct Answer: User provides a location name in response to a previous question (e.g., "Where are you?" -> "Plaza").
         - Contextual Assertion: "We are staying in Marianao".
+        - CORRECTIONS/ASSERTIONS: The user explicitly corrects the bot regarding the validity or existence of a location (e.g., "X is a valid place", "No, I am in Y").
         
         ACTION:
         - intent_type: 'SELF_LOC'
@@ -591,25 +593,196 @@ def build(username: str, conversation: Conversation) -> Lingo:
                         pass
                 return False, municipality
         return False, None
-
-    @chatbot.skill
-    async def city_explorer(ctx: Context, engine: Engine):
+    
+    class ResourceAction(BaseModel):
         """
-        Architect of Itineraries and Spatial Logic within the Hospitality Network.
-
-        DATA BOUNDARY:
-        - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
-
-        RESPONSIBILITY:
-        - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
-        - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
-
-        NEGATIVE CONSTRAINTS (Intrinsic Limit):
-        - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
-        - **Item Specs**: Does not handle menus or room prices (Micro-level data).
+        Represents a generic step to acquire ANY type of resource using a configured capability.
         """
+        tool_id: str = Field(..., description="The identifier of the tool to execute.")
+        query_parameter: str = Field(..., description="The input parameter for the tool (in User's Language).")
+        reasoning: str = Field(..., description="Why is this resource required for the abstract plan?")
 
-        logger.info("Skill: CityExplorerSkill")
+    class StrategicPlan(BaseModel):
+        """
+        The abstract architecture of the user's desired experience.
+        """
+        actions: List[ResourceAction] = Field(..., description="The sequence of steps to execute.")
+    
+    # @chatbot.skill
+    # async def city_explorer(ctx: Context, engine: Engine):
+    #     """
+    #     DOMAIN: Experience Architecture & Resource Orchestration.
+
+    #     NATURE OF SKILL:
+    #     Specialized in constructing "Logically Structured Solutions" rather than "Atomic Data Retrieval". 
+    #     It activates when the request implies a CONSTRUCTION (a plan, a sequence, a bundle) rather than a simple SELECTION.
+
+    #     AUTHORITY (The "Constructor" Logic):
+    #     1. COMPOSITE NEEDS: Requests requiring the aggregation of DISPARATE entity types into a single result (e.g., "Resource A AND Resource B").
+    #     2. TEMPORAL FLOWS: Requests implying a distribution of resources over time or sequence (e.g., "Schedule", "Itinerary", "Route").
+    #        - NOTE: A sequence remains a Plan even if it uses only one entity type (e.g., "A 3-day sequence of [Type X]" is a Plan).
+
+    #     EXCLUSIONS (The "Fetcher" Logic):
+    #     1. STATIC COLLECTIONS: Requests asking for a filtered list of items of a single type WITHOUT temporal structure.
+    #        - Logic: "Show me available [Type X]" is an Inventory Query -> Exclude.
+    #        - Logic: "Plan a sequence of [Type X]" is a Construction -> Include.
+        
+    #     2. PURE ORIENTATION:
+    #        - Requests asking for the location/coordinates of a specific entity (Anchor) without consuming it.
+    #     """
+    #     logger.info("Skill: CityExplorer (Abstract Orchestrator)")
+
+    #     # --------------------------------------------------------------------------
+    #     # 1. CAPABILITY REGISTRY (User Configuration)
+    #     # --------------------------------------------------------------------------
+    #     # This list defines the "Universe of Capabilities". 
+    #     # The logic below is completely agnostic to what these strings actually represent.
+    #     CONFIGURED_CAPABILITIES = [
+    #         "search_hotels_by_description", 
+    #         "search_restaurants_by_description",
+    #         # Add any new search tool here (e.g., "search_events", "search_books")
+    #         # and the system will automatically learn to use it.
+    #     ]
+        
+    #     # Validate existence of tools in the runtime
+    #     available_tools = [t for t in chatbot.tools if t.name in CONFIGURED_CAPABILITIES]
+
+    #     if not available_tools:
+    #         await engine.reply(ctx, "System Error: No orchestration capabilities configured.", STD_REPLY_INSTRUCTION)
+    #         return
+
+    #     tool_map = {t.name: t for t in available_tools}
+        
+    #     # Build an Abstract Manifest for the LLM
+    #     # We present tools as "Generic Capabilities" to avoid domain bias.
+    #     manifest = "\n".join([f"- Capability ID: {t.name} | Description: {t.description}" for t in available_tools])
+
+    #     # --------------------------------------------------------------------------
+    #     # 2. CONTEXT & CONSTRAINT ANALYSIS
+    #     # --------------------------------------------------------------------------
+    #     with ctx.fork() as logic_ctx:
+    #         intent = await get_user_intent(logic_ctx, engine)
+            
+    #         # Abstract Constraint: Spatial/Contextual grounding
+    #         constraint_context = ""
+    #         if intent.requires_proximity:
+    #             is_fresh, loc_name = check_location_freshness(logic_ctx)
+    #             if not is_fresh:
+    #                  msg = await engine.reply(ctx, "I need to establish the location context to proceed.", STD_REPLY_INSTRUCTION)
+    #                  ctx.append(msg)
+    #                  return
+    #             constraint_context = f" restricted to context: {loc_name}"
+
+    #         # Abstract Constraint: Volume/Quantity
+    #         limit_data = await get_search_limit(logic_ctx, engine, default=3)
+    #         exec_volume = limit_data.quantity
+
+    #         # --------------------------------------------------------------------------
+    #         # 3. STRATEGIC PLANNING (The "Brain")
+    #         # --------------------------------------------------------------------------
+    #         # The prompt treats everything as "Objective" vs "Capabilities".
+            
+    #         planner_prompt = f"""
+    #         USER OBJECTIVE: "{intent.search_query} {constraint_context}"
+            
+    #         SYSTEM CAPABILITIES:
+    #         {manifest}
+            
+    #         TASK: Architect a Strategic Plan to satisfy the User Objective using ONLY the System Capabilities.
+            
+    #         INSTRUCTIONS:
+    #         1. Deconstruct the Objective into required RESOURCE ACQUISITIONS.
+    #         2. Map each requirement to the most appropriate Capability ID.
+    #         3. Formulate the 'query_parameter' for each step.
+    #            - CRITICAL: Keep the query in the USER'S LANGUAGE.
+    #            - CRITICAL: Embed any active constraints ({constraint_context}) into the query.
+    #         """
+            
+    #         blueprint = await engine.create(logic_ctx, StrategicPlan, Message.system(planner_prompt))
+    #         logger.info(f"CityExplorer - Plan Generated: {len(blueprint.actions)} actions.")
+
+    #         # --------------------------------------------------------------------------
+    #         # 4. DYNAMIC EXECUTION (The "Engine")
+    #         # --------------------------------------------------------------------------
+    #         collected_resources = []
+    #         exec_ctx = ctx.fork() # Clean execution environment
+            
+    #         for step in blueprint.actions:
+    #             tool = tool_map.get(step.tool_id)
+    #             if not tool:
+    #                 continue
+                
+    #             try:
+    #                 # Generic Invocation Contract: (description_query, limit)
+    #                 # This assumes all "search_" tools adhere to this interface.
+    #                 output = await engine.invoke(
+    #                     exec_ctx, 
+    #                     tool, 
+    #                     description_query=step.query_parameter, 
+    #                     limit=exec_volume
+    #                 )
+                    
+    #                 if output and not output.error:
+    #                     # Agnostic Data Extraction
+    #                     # We look for the payload without assuming specific keys like "hotels" or "books".
+    #                     payload = output.result
+    #                     items = []
+                        
+    #                     if isinstance(payload, dict):
+    #                         # Priority 1: Standard 'results' key
+    #                         if "results" in payload:
+    #                             items = payload["results"]
+    #                         else:
+    #                             # Priority 2: Heuristic scan for any list
+    #                             for v in payload.values():
+    #                                 if isinstance(v, list) and v:
+    #                                     items = v
+    #                                     break
+    #                     elif isinstance(payload, list):
+    #                         items = payload
+                        
+    #                     if items:
+    #                         collected_resources.extend(items)
+                            
+    #             except Exception as e:
+    #                 logger.error(f"Execution Error in step {step.tool_id}: {e}")
+
+    #         if not collected_resources:
+    #             await engine.reply(ctx, "Unable to retrieve the necessary resources for this plan.", STD_REPLY_INSTRUCTION)
+    #             return
+
+    #         # --------------------------------------------------------------------------
+    #         # 5. SYNTHESIS (The "Narrator")
+    #         # --------------------------------------------------------------------------
+    #         response_ctx = ctx.clone()
+            
+    #         # Serialize generic data
+    #         data_block = f"--- ACQUIRED RESOURCES (Total: {len(collected_resources)}) ---\n"
+    #         data_block += str(collected_resources)[:4000] # Safety truncation
+            
+    #         response_ctx.append(Message.system(data_block))
+            
+    #         synthesis_prompt = f"""
+    #         ROLE: Strategic Planner.
+    #         OBJECTIVE: "{intent.search_query}"
+            
+    #         TASK: Synthesize the ACQUIRED RESOURCES into a cohesive narrative structure.
+    #         - Structure: Create a logical flow (e.g. Sequence, Comparison, or Bundle).
+    #         - Reasoning: Explain why these resources were selected to meet the objective.
+    #         """
+            
+    #         final_msg = await engine.reply(response_ctx, synthesis_prompt, STD_REPLY_INSTRUCTION, ANTI_HALLUCINATION_GUARD)
+            
+    #         # --------------------------------------------------------------------------
+    #         # 6. STATE PERSISTENCE
+    #         # --------------------------------------------------------------------------
+    #         save_search_snapshot(ctx, intent.search_query, len(collected_resources))
+            
+    #         # Save raw data for downstream skills (generic reference)
+    #         token_res = active_results.set(copy.deepcopy(collected_resources))
+    #         token_init = active_initial_results.set(copy.deepcopy(collected_resources))
+            
+    #         ctx.append(final_msg)
 
     @chatbot.skill
     async def concierge(ctx: Context, engine: Engine):
@@ -1300,121 +1473,126 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 ctx, "System Error: Location tools are missing.", STD_REPLY_INSTRUCTION
             )
             return
+        token_eng = active_engine.set(engine)
+        token_ctx = active_ctx.set(ctx)
+        try:
+            intent = await get_spatial_intent(ctx, engine)
 
-        intent = await get_spatial_intent(ctx, engine)
+            if intent.intent_type == SpatialIntentType.SELF_LOC:
+                target = intent.target_entities[0] if intent.target_entities else ""
 
-        if intent.intent_type == SpatialIntentType.SELF_LOC:
-            target = intent.target_entities[0] if intent.target_entities else ""
-
-            if not target:
-                msg = await engine.reply(
-                    ctx,
-                    "Ask the user to repeat the location because it was not clear.",
-                    STD_REPLY_INSTRUCTION,
-                )
-                ctx.append(msg)
-                return
-
-            await engine.invoke(ctx, loc_tool, municipality=target)
-
-            is_set = any("USER_LOCATION:" in m.content for m in ctx.messages[-2:])
-            if not is_set:
-                msg = await engine.reply(
-                    ctx,
-                    "Inform the user that the provided location is not recognized as a valid Cuban municipality and ask for clarification.",
-                    STD_REPLY_INSTRUCTION,
-                )
-                ctx.append(msg)
-                return
-
-            pending_query = None
-            for msg in reversed(ctx.messages):
-                if (
-                    msg.role == "system"
-                    and "SYSTEM_STATE: STATUS='WAITING_LOCATION'" in msg.content
-                ):
-                    query_match = re.search(r"QUERY='(.*?)'", msg.content)
-                    if query_match:
-                        pending_query = query_match.group(1)
-                        break
-
-            if pending_query:
-                logger.info(
-                    f"Location Fixed. Re-executing pending query: {pending_query}"
-                )
-                ctx.append(
-                    Message.system(
-                        f"ROUTING_DIRECTIVE: Location resolved. ACTION REQUIRED: Resume execution for pending query: '{pending_query}' with the user location (municipality)."
+                if not target:
+                    msg = await engine.reply(
+                        ctx,
+                        "Ask the user to repeat the location because it was not clear.",
+                        STD_REPLY_INSTRUCTION,
                     )
+                    ctx.append(msg)
+                    return
+
+                await engine.invoke(ctx, loc_tool, municipality=target)
+
+                is_set = any("USER_LOCATION:" in m.content for m in ctx.messages[-2:])
+                if not is_set:
+                    msg = await engine.reply(
+                        ctx,
+                        "Inform the user that the provided location is not recognized as a valid Cuban municipality and ask for clarification.",
+                        STD_REPLY_INSTRUCTION,
+                    )
+                    ctx.append(msg)
+                    return
+
+                pending_query = None
+                for msg in reversed(ctx.messages):
+                    if (
+                        msg.role == "system"
+                        and "SYSTEM_STATE: STATUS='WAITING_LOCATION'" in msg.content
+                    ):
+                        query_match = re.search(r"QUERY='(.*?)'", msg.content)
+                        if query_match:
+                            pending_query = query_match.group(1)
+                            break
+
+                if pending_query:
+                    logger.info(
+                        f"Location Fixed. Re-executing pending query: {pending_query}"
+                    )
+                    ctx.append(
+                        Message.system(
+                            f"ROUTING_DIRECTIVE: Location resolved. ACTION REQUIRED: Resume execution for pending query: '{pending_query}' with the user location (municipality)."
+                        )
+                    )
+                    main_flow = chatbot._build_flow()
+                    await main_flow.execute(ctx, engine)
+                    return
+
+                msg = await engine.reply(
+                    ctx,
+                    f"Confirm that the location has been set to '{target}' and ask the user what they would like to do next.",
+                    STD_REPLY_INSTRUCTION,
                 )
-                main_flow = chatbot._build_flow()
-                await main_flow.execute(ctx, engine)
+                ctx.append(msg)
                 return
 
-            msg = await engine.reply(
-                ctx,
-                f"Confirm that the location has been set to '{target}' and ask the user what they would like to do next.",
-                STD_REPLY_INSTRUCTION,
-            )
-            ctx.append(msg)
-            return
+            elif intent.intent_type == SpatialIntentType.ANCHOR_LOC:
+                resolved_areas = set()
+                resolution_log = []
 
-        elif intent.intent_type == SpatialIntentType.ANCHOR_LOC:
-            resolved_areas = set()
-            resolution_log = []
+                for anchor in intent.target_entities:
+                    res = await engine.invoke(
+                        ctx,
+                        find_tool,
+                        place_name=anchor,
+                        place_type=intent.anchor_type.value,
+                    )
 
-            for anchor in intent.target_entities:
-                res = await engine.invoke(
-                    ctx,
-                    find_tool,
-                    place_name=anchor,
-                    place_type=intent.anchor_type.value,
-                )
+                    if res and res.result and res.result.get("municipality"):
+                        mun = res.result["municipality"]
+                        resolved_areas.add(mun)
+                        resolution_log.append(f"{anchor}->{mun}")
+                    else:
+                        logger.warning(f"Could not resolve anchor: {anchor}")
 
-                if res and res.result and res.result.get("municipality"):
-                    mun = res.result["municipality"]
-                    resolved_areas.add(mun)
-                    resolution_log.append(f"{anchor}->{mun}")
+                if resolved_areas:
+                    areas_list = list(resolved_areas)
+
+                    pending_query = next(
+                        (m.content for m in reversed(ctx.messages) if m.role == "user"),
+                        "User request not found",
+                    )
+
+                    ctx.append(
+                        Message.system(
+                            f"SPATIAL_CONTEXT: User targets areas (municipalities): {areas_list}. "
+                            f"SOURCE: Derived from cross-domain anchors {intent.target_entities}. Log: {resolution_log}"
+                            f"[Context Hint: The active search MUNICIPALITY should match one of {areas_list}]"
+                        )
+                    )
+
+                    ctx.append(
+                        Message.system(
+                            f"STATUS: Location resolution is COMPLETE. "
+                            f"ROUTING_DIRECTIVE: Spatial context (municipalities) is SET to {areas_list}. "
+                            f"ACTION REQUIRED: Resume execution for pending query: '{pending_query}' applying the new area constraints. "
+                        )
+                    )
+
+                    logger.info("Spatial Context Set. Handing over to Router.")
+                    main_flow = chatbot._build_flow()
+                    await main_flow.execute(ctx, engine)
+                    return
+
                 else:
-                    logger.warning(f"Could not resolve anchor: {anchor}")
-
-            if resolved_areas:
-                areas_list = list(resolved_areas)
-
-                pending_query = next(
-                    (m.content for m in reversed(ctx.messages) if m.role == "user"),
-                    "User request not found",
-                )
-
-                ctx.append(
-                    Message.system(
-                        f"SPATIAL_CONTEXT: User targets areas (municipalities): {areas_list}. "
-                        f"SOURCE: Derived from cross-domain anchors {intent.target_entities}. Log: {resolution_log}"
-                        f"[Context Hint: The active search MUNICIPALITY should match one of {areas_list}]"
+                    msg = await engine.reply(
+                        ctx,
+                        f"Inform the user that the places {intent.target_entities} could not be located in the inventory. Ask them to provide the municipality manually.",
+                        STD_REPLY_INSTRUCTION,
                     )
-                )
-
-                ctx.append(
-                    Message.system(
-                        f"STATUS: Location resolution is COMPLETE. "
-                        f"ROUTING_DIRECTIVE: Spatial context (municipalities) is SET to {areas_list}. "
-                        f"ACTION REQUIRED: Resume execution for pending query: '{pending_query}' applying the new area constraints. "
-                    )
-                )
-
-                logger.info("Spatial Context Set. Handing over to Router.")
-                main_flow = chatbot._build_flow()
-                await main_flow.execute(ctx, engine)
-                return
-
-            else:
-                msg = await engine.reply(
-                    ctx,
-                    f"Inform the user that the places {intent.target_entities} could not be located in the inventory. Ask them to provide the municipality manually.",
-                    STD_REPLY_INSTRUCTION,
-                )
-                ctx.append(msg)
-                return
+                    ctx.append(msg)
+        
+        finally:
+            active_engine.reset(token_eng)
+            active_ctx.reset(token_ctx)
 
     @chatbot.skill
     async def casual_chat(ctx: Context, engine: Engine):
