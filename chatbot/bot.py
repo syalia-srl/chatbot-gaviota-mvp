@@ -171,12 +171,11 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         return await engine.create(ctx, UserIntent, Message.system(prompt))
     
-    # --- CAMBIO 1: AGREGAR ENUM Y ACTUALIZAR SEARCHLIMIT ---
     class PaginationAction(str, Enum):
-        NEW_SEARCH = "new_search"       # Reset Total (Cambio de filtros/tema)
-        EXPAND = "expand"               # "Dame más", "Siguientes" (Aumentar el límite acumulado)
-        VARIATION = "variation"         # "Dame otros" (Offset/Salto)
-        SHRINK = "shrink"               # "Dame menos", "Solo 3" (Reducir el límite acumulado)
+        NEW_SEARCH = "new_search"       
+        EXPAND = "expand"               
+        VARIATION = "variation"         
+        SHRINK = "shrink"               
 
     class SearchLimit(BaseModel):
         """Structure to extract the exact quantity and navigation intent."""
@@ -187,29 +186,75 @@ def build(username: str, conversation: Conversation) -> Lingo:
         )
         reasoning: str
 
-    async def get_search_limit(ctx: Context, engine: Engine, default: int = 20) -> int:
+    async def get_search_limit(ctx: Context, engine: Engine, default: int = 5) -> SearchLimit:
         """
-        Retrieves the SearchLimit structure to determine the magnitude of the request,
-        and returns the final processed integer (applying safety floors).
+        Retrieves the SearchLimit structure to determine quantity and ACTION.
         """
         prompt = """
-        Analyze the User's request to identify the 'Search Universe Size' (quantity).
+        Analyze the User's Request to determine the QUANTITY (int) and the INTENT ACTION (Enum).
         
-        SCENARIOS:
-        - Explicit: "Show me 3 options" -> quantity=3
-        - Implied Short: "Give me a couple" -> quantity=2
-        - Conditional: "4 items, but only 1 red one" -> quantity=4 (We need the initial pool size).
+        --- ACTIONS DEFINITIONS ---
         
-        CRITICAL RULES:
-        1. If the user DOES NOT specify or imply a quantity (e.g., "Find restaurants" or "Show me hotels"), you MUST set quantity to null (None).
-        2. Do NOT invent numbers. If no number is requested, return None.
+        A. 'new_search' (RESET / RE-RANK):
+           - Definition: The user modifies the search CRITERIA (filters, topic) OR explicitly restarts.
+           - Triggers: "With pool", "Cheaper", "In Vedado", "Start over", "Search again".
+           - PRIORITY RULE: If the user adds a condition (even if they say "show me more"), it is ALWAYS 'new_search' because the ranking changes.
+           
+        B. 'expand' (ACCUMULATE / DEPTH):
+           - Definition: User wants to lengthen the current list (Keep previous + Add new).
+           - Triggers: "Show me more", "Continue", "List more options", "What else is there?", "Go on".
+           
+        C. 'variation' (SUBSTITUTE / PAGING):
+           - Definition: User wants to DISCARD/SKIP the specific items already shown and see different ones from the same list.
+           - Triggers: "Show me others", "Different ones", "Next page", "The next 5", "I don't like these", "Any others?".
+           - Context: The user rejects the visible set or wants to scroll horizontally.
+           
+        D. 'shrink' (FOCUS / SUBSET):
+           - Definition: User selects a smaller subset or asks for less.
+           - Triggers: "Just the best one", "Only the top 3", "Give me less", "Pick one".
+
+        --- QUANTITY INFERENCE RULES ---
+        - explicit: "Show 5" -> 5
+        - vague: "A couple" -> 2 | "A few" -> 3 | "The rest" -> 10
+        - singular: "The next one", "Another one" -> 1
+        
+        --- MATH SEMANTICS (CRITICAL) ---
+        1. IF Action is 'expand' or 'variation' ("more", "others"):
+           - Treat the quantity as an INCREMENT (How many *additional* items to add).
+           - "10 more" -> quantity=10 (Middleware will do: Current + 10).
+           
+        2. IF Action is 'shrink' or 'new_search' ("less", "only", "filter"):
+           - Treat the quantity as the TARGET TOTAL (The new ceiling).
+           - "Give me 10 less" -> quantity=10 (Middleware will do: Limit = 10).
+           - "Only 3" -> quantity=3.
+        
+        OUTPUT FORMAT: JSON compatible with SearchLimit model.
         """
 
         limit_data = await engine.create(ctx, SearchLimit, Message.system(prompt))
 
         qty = limit_data.quantity if limit_data.quantity is not None else default
+        
+        if limit_data.action != PaginationAction.SHRINK:
+            qty = max(qty, 3) 
 
-        return max(qty, 20)
+        limit_data.quantity = qty
+        
+        return limit_data
+    
+    def save_search_snapshot(ctx: Context, query: str, limit: int):
+        """
+        It records a milestone in the history.
+        It does NOT delete previous snapshots to preserve the navigation trail.
+        The reading logic will ensure that only the most recent one is used.
+        """
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        snapshot_msg = Message.system(
+            f"SEARCH_SNAPSHOT: Query='{query}' | Limit='{limit}' | Time='{timestamp}'"
+        )
+        
+        ctx.append(snapshot_msg)
 
     class ScopeType(str, Enum):
         "Enum for scope type"
@@ -307,8 +352,12 @@ def build(username: str, conversation: Conversation) -> Lingo:
              -> STOP THE PLAN. DO NOT GENERATE THE NEXT STEP.
              -> It is strictly prohibited to plan actions for entities whose names are not yet known.
              -> Return a partial plan (e.g., just the Filter/Search step).
-        
-        3. SCOPE DEFINITION:
+        3. THE 'SINGLETON' UPGRADE RULE (The "Pick One" Logic):
+           - TRIGGER: IF the 'DATA CONTEXT SUMMARY' contains exactly ONE candidate (or a very small list and the user asks for "the best").
+           - ACTION: You MUST generate a 'get_details' step for that specific entity instead of just listing it.
+           - REASONING: If the user narrowed it down to one (or asked for "the best"), they expect a full recommendation card, not a list of 1.
+           
+        4. SCOPE DEFINITION:
            - SCOPE 'isolated': Use this for new searches or specific entity inspections.
            - SCOPE 'chained': Use ONLY if passing a known, single, concrete output to a tool that explicitly accepts generic input (Rare). Never use for atomic inspection tools.
         
@@ -455,7 +504,6 @@ def build(username: str, conversation: Conversation) -> Lingo:
         Analyzes the user's input using SEMANTIC ROLE LABELING (Not Grammar).
         It identifies if the user is establishing their position or referencing another entity.
         """
-        # Tipos válidos para referencias externas
         entity_types = [t.value for t in SpatialAnchorType if t.value != "person"]
 
         prompt = f"""
@@ -544,24 +592,24 @@ def build(username: str, conversation: Conversation) -> Lingo:
                 return False, municipality
         return False, None
 
-    # @chatbot.skill
-    # async def city_explorer(ctx: Context, engine: Engine):
-    #     """
-    #     Architect of Itineraries and Spatial Logic within the Hospitality Network.
+    @chatbot.skill
+    async def city_explorer(ctx: Context, engine: Engine):
+        """
+        Architect of Itineraries and Spatial Logic within the Hospitality Network.
 
-    #     DATA BOUNDARY:
-    #     - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
+        DATA BOUNDARY:
+        - Strictly limited to the known inventory of **Hotels** and **Restaurants**.
 
-    #     RESPONSIBILITY:
-    #     - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
-    #     - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
+        RESPONSIBILITY:
+        - Logistics: Planning sequences of activities involving dining and lodging (e.g., "Plan a dinner near Hotel Nacional").
+        - Spatial Relations: Connecting known entities based on proximity (e.g., "Which restaurants are close to this hotel?").
 
-    #     NEGATIVE CONSTRAINTS (Intrinsic Limit):
-    #     - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
-    #     - **Item Specs**: Does not handle menus or room prices (Micro-level data).
-    #     """
+        NEGATIVE CONSTRAINTS (Intrinsic Limit):
+        - **Unknown Infrastructure**: Does NOT possess data on banks, pharmacies, supermarkets, or generic urban services.
+        - **Item Specs**: Does not handle menus or room prices (Micro-level data).
+        """
 
-    #     logger.info("Skill: CityExplorerSkill")
+        logger.info("Skill: CityExplorerSkill")
 
     @chatbot.skill
     async def concierge(ctx: Context, engine: Engine):
@@ -652,23 +700,73 @@ def build(username: str, conversation: Conversation) -> Lingo:
                                 f"Proximity valid. Using stored location: {loc_name}"
                             )
 
-                    logger.info("Concierge - Getting limit")
-                    limit_count = await get_search_limit(fork_ctx, engine)
-                    real_limit = limit_count * 2
+                    logger.info("Concierge - Getting limit and action")
+                    limit_data = await get_search_limit(fork_ctx, engine)
+                    
+                    base_limit = 0
+                    snapshots = [m for m in fork_ctx.messages if m.role == "system" and "SEARCH_SNAPSHOT" in m.content]
+                    
+                    if intent.context_scope == ContextScope.REFINE and snapshots:
+                        last_snap = snapshots[-1]
+                        l_match = re.search(r"Limit='(\d+)'", last_snap.content)
+                        if l_match:
+                            base_limit = int(l_match.group(1))
 
-                    logger.info(f"Concierge - Searching for {real_limit} candidates")
+                    target_qty = limit_data.quantity           
+                    safe_qty = target_qty * 2                  #
+                    
+                    fetch_limit = 0
+                    slice_start = 0
+                    slice_end = None 
+
+                    if limit_data.action == PaginationAction.EXPAND:
+                        fetch_limit = base_limit + safe_qty
+                        
+                        slice_end = base_limit + safe_qty
+
+                    elif limit_data.action == PaginationAction.VARIATION:
+                        fetch_limit = base_limit + safe_qty
+                        
+                        slice_start = base_limit
+                        slice_end = base_limit + safe_qty 
+
+                    elif limit_data.action == PaginationAction.SHRINK:
+                        fetch_limit = safe_qty 
+                        slice_start = 0
+                        slice_end = safe_qty 
+                        
+                    else: 
+                        fetch_limit = safe_qty
+                        slice_start = 0
+                        slice_end = safe_qty 
+
+                    logger.info(f"Skill - Executing: Query='{intent.search_query}' | Fetch DB={fetch_limit} | Context Slice={slice_start}:{slice_end}")
+                    
                     search_output = await engine.invoke(
                         fork_ctx,
                         search_tool,
                         description_query=intent.search_query,
-                        limit=real_limit,
+                        limit=fetch_limit,
                     )
 
                     candidates = []
                     if search_output and not search_output.error:
-                        candidates = search_output.result.get(
-                            "hotels", search_output.result.get("results", [])
-                        )
+                        res = search_output.result
+                        raw_candidates = res.get("hotels", res.get("results", []))                        
+                        if slice_end is not None:
+                             candidates = raw_candidates[slice_start : slice_end]
+                        else:
+                             candidates = raw_candidates[slice_start:]
+                        if candidates and intent.context_scope != ContextScope.ISOLATED:
+                            current_frontier = base_limit + len(candidates)
+                            
+                            if limit_data.action == PaginationAction.SHRINK or limit_data.action == PaginationAction.NEW_SEARCH:
+                                current_frontier = len(candidates)
+                            
+                            if slice_end and limit_data.action == PaginationAction.VARIATION:
+                                current_frontier = slice_end
+
+                            save_search_snapshot(ctx, intent.search_query, current_frontier)
 
                     if not candidates:
                         final_response_msg = await engine.reply(
@@ -928,26 +1026,73 @@ def build(username: str, conversation: Conversation) -> Lingo:
                                 f"Proximity valid. Using stored location: {loc_name}"
                             )
 
-                    logger.info("GastroGuideSkill - Getting limit")
-                    limit_count = await get_search_limit(fork_ctx, engine)
-                    real_limit = limit_count * 2
-                    logger.info(f"GastroGuideSkill - limit {real_limit}")
+                    logger.info("GastroGuideSkill - Getting limit and action")
+                    limit_data = await get_search_limit(fork_ctx, engine)
+                    
+                    base_limit = 0
+                    snapshots = [m for m in fork_ctx.messages if m.role == "system" and "SEARCH_SNAPSHOT" in m.content]
+                    
+                    if intent.context_scope == ContextScope.REFINE and snapshots:
+                        last_snap = snapshots[-1]
+                        l_match = re.search(r"Limit='(\d+)'", last_snap.content)
+                        if l_match:
+                            base_limit = int(l_match.group(1))
 
-                    logger.info(
-                        f"GastroGuideSkill - Searching for {real_limit} candidates"
-                    )
+                    target_qty = limit_data.quantity          
+                    safe_qty = target_qty * 2                 
+                    
+                    fetch_limit = 0
+                    slice_start = 0
+                    slice_end = None 
+
+                    if limit_data.action == PaginationAction.EXPAND:
+                        fetch_limit = base_limit + safe_qty
+                        
+                        slice_end = base_limit + safe_qty
+
+                    elif limit_data.action == PaginationAction.VARIATION:
+                        fetch_limit = base_limit + safe_qty
+                        
+                        slice_start = base_limit
+                        slice_end = base_limit + safe_qty 
+
+                    elif limit_data.action == PaginationAction.SHRINK:
+                        fetch_limit = safe_qty 
+                        slice_start = 0
+                        slice_end = safe_qty 
+                        
+                    else: 
+                        fetch_limit = safe_qty
+                        slice_start = 0
+                        slice_end = safe_qty 
+
+                    logger.info(f"Skill - Executing: Query='{intent.search_query}' | Fetch DB={fetch_limit} | Context Slice={slice_start}:{slice_end}")
+                    
                     search_output = await engine.invoke(
                         fork_ctx,
                         search_tool,
                         description_query=intent.search_query,
-                        limit=real_limit,
+                        limit=fetch_limit,
                     )
 
                     candidates = []
                     if search_output and not search_output.error:
-                        candidates = search_output.result.get(
-                            "results", search_output.result.get("restaurants", [])
-                        )
+                        res = search_output.result
+                        raw_candidates = res.get("restaurants", res.get("results", []))                        
+                        if slice_end is not None:
+                             candidates = raw_candidates[slice_start : slice_end]
+                        else:
+                             candidates = raw_candidates[slice_start:]
+                        if candidates and intent.context_scope != ContextScope.ISOLATED:
+                            current_frontier = base_limit + len(candidates)
+                            
+                            if limit_data.action == PaginationAction.SHRINK or limit_data.action == PaginationAction.NEW_SEARCH:
+                                current_frontier = len(candidates)
+                            
+                            if slice_end and limit_data.action == PaginationAction.VARIATION:
+                                current_frontier = slice_end
+
+                            save_search_snapshot(ctx, intent.search_query, current_frontier)
 
                     if not candidates:
                         final_response_msg = await engine.reply(
@@ -1747,7 +1892,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
             specialty_keywords: List[str] = Field(
                 default=[],
-                description="eywords for SPECIFIC FOOD OR DRINK ITEMS (e.g., 'lobster', 'pizza'). DO NOT include adjectives like 'romantic', 'cozy' or 'cheap', etc.",
+                description="Keywords for SPECIFIC FOOD OR DRINK ITEMS (e.g., 'lobster', 'pizza'). DO NOT include adjectives like 'romantic', 'cozy' or 'cheap', etc.",
             )
             excluded_keywords: List[str] = Field(
                 default=[],
@@ -2146,10 +2291,10 @@ def build(username: str, conversation: Conversation) -> Lingo:
         official_mun = await resolve_municipality_semantic(ctx, engine, municipality)
 
         if official_mun:
-            ctx.messages = [
-                m for m in ctx.messages
-                if not (m.role == "system" and "USER_LOCATION:" in m.content)
-            ]
+            # ctx.messages = [
+            #     m for m in ctx.messages
+            #     if not (m.role == "system" and "USER_LOCATION:" in m.content)
+            # ]
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
