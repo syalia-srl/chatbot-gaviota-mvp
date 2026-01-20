@@ -170,8 +170,24 @@ def build(username: str, conversation: Conversation) -> Lingo:
         """
 
         return await engine.create(ctx, UserIntent, Message.system(prompt))
+    
+    # --- CAMBIO 1: AGREGAR ENUM Y ACTUALIZAR SEARCHLIMIT ---
+    class PaginationAction(str, Enum):
+        NEW_SEARCH = "new_search"       # Reset Total (Cambio de filtros/tema)
+        EXPAND = "expand"               # "Dame más", "Siguientes" (Aumentar el límite acumulado)
+        VARIATION = "variation"         # "Dame otros" (Offset/Salto)
+        SHRINK = "shrink"               # "Dame menos", "Solo 3" (Reducir el límite acumulado)
 
-    async def get_search_limit(ctx: Context, engine: Engine, default: int = 5) -> int:
+    class SearchLimit(BaseModel):
+        """Structure to extract the exact quantity and navigation intent."""
+        quantity: Optional[int] = Field(None, description="The specific number requested.")
+        action: PaginationAction = Field(
+            default=PaginationAction.NEW_SEARCH,
+            description="Navigation intent: 'new_search' (default), 'expand' (add more), 'variation' (skip current), 'shrink' (reduce quantity)."
+        )
+        reasoning: str
+
+    async def get_search_limit(ctx: Context, engine: Engine, default: int = 20) -> int:
         """
         Retrieves the SearchLimit structure to determine the magnitude of the request,
         and returns the final processed integer (applying safety floors).
@@ -193,7 +209,7 @@ def build(username: str, conversation: Conversation) -> Lingo:
 
         qty = limit_data.quantity if limit_data.quantity is not None else default
 
-        return max(qty, 5)
+        return max(qty, 20)
 
     class ScopeType(str, Enum):
         "Enum for scope type"
