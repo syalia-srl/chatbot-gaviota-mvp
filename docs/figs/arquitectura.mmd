@@ -1,0 +1,26 @@
+flowchart LR
+    User(("Usuario<br/>Telegram"))
+    subgraph App["Capa Telegram"]
+        Polling["chatbot/app.py<br/>polling + handlers"]
+        ConvH["ConversationHandler<br/>(historial por user_id)"]
+    end
+    subgraph Agent["Capa de agente (Lingo AI)"]
+        Skills["4 skills:<br/>concierge, gastro_guide,<br/>location_manager, casual_chat"]
+        Pipeline["Pipeline de razonamiento<br/>estructurado (Pydantic)"]
+        Tools["Tools de inventario"]
+    end
+    subgraph Data["Capa de datos (BeaverDB)"]
+        Inv[("Colecciones de<br/>inventario<br/>(vector index)")]
+        Conv[("conversation:user_id<br/>+ configs:user_id")]
+    end
+    LLM[/"OpenRouter<br/>(Gemini 2.5 Flash)"/]
+    Emb[/"LM Studio local<br/>(nomic-embed)"/]
+
+    User <--> Polling
+    Polling --> ConvH
+    ConvH --> Skills
+    Skills --> Pipeline --> Tools
+    Pipeline <--> LLM
+    Tools <--> Inv
+    Tools <--> Emb
+    ConvH <--> Conv
