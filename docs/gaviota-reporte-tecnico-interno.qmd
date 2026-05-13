@@ -17,7 +17,9 @@ format:
 
 ## 1. Resumen
 
-El Chatbot Gaviota MVP es un asistente conversacional Telegram (`gaviota_bot`) construido como prueba de concepto durante un curso impartido en Gaviota S.A., conjunto entre la Universidad de Alicante (GPLSI) y la Universidad de La Habana (GIA-UH), con apoyo de SYALIA SRL. **El sistema no tiene propósitos comerciales, sólo demostrativos**, y sirve como artefacto pedagógico para ilustrar la integración de modelos de lenguaje, búsqueda vectorial, agentes con herramientas y razonamiento estructurado en un dominio aplicado: el turismo gastronómico y hotelero en Cuba. El asistente es multilingüe por demanda —responde en el idioma original del usuario— y opera sobre un inventario de hoteles, restaurantes y lugares indexado localmente como datos en formato JSON.
+El Chatbot Gaviota MVP es un asistente conversacional Telegram (`gaviota_bot`) construido como prueba de concepto durante un curso impartido en Gaviota S.A., conjunto entre la Universidad de Alicante (GPLSI) y la Universidad de La Habana (GIA-UH), con apoyo de SYALIA SRL. **El sistema no tiene propósitos comerciales, sólo demostrativos**, y sirve como artefacto pedagógico para ilustrar la integración de modelos de lenguaje, búsqueda vectorial, agentes con herramientas y razonamiento estructurado en un dominio aplicado: el turismo gastronómico y hotelero en Cuba.
+
+El asistente es multilingüe por demanda —responde en el idioma original del usuario— y opera sobre un inventario de hoteles, restaurantes y lugares indexado localmente como datos en formato JSON. Puede ser utilizado con cualquier modelo de lenguaje. Por defecto, se construyó usando como referencia al modelo Cecilia 2B, versión 1.0 creado por la Universidad de La Habana y la Universidad de Alicante; y el modelo Salamandra 2B, creado por el Barcelona Supercomputing Center, respectivamente.
 
 ## 2. Arquitectura del sistema
 
